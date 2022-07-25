@@ -149,6 +149,14 @@ impl FinalBuildConfiguration {
                 cflags.push(format!("--sysroot={}", sysroot));
             }
 
+            if let Some(skia_extra_cflags) = cargo::env_var("SKIA_EXTRA_CFLAGS") {
+                cflags.extend(
+                    skia_extra_cflags
+                        .split_whitespace()
+                        .map(|opt| opt.to_string()),
+                );
+            }
+
             let jpeg_sys_cflags: Vec<String>;
             if cfg!(feature = "use-system-jpeg-turbo") {
                 let paths = cargo::env_var("DEP_JPEG_INCLUDE").expect("mozjpeg-sys include path");

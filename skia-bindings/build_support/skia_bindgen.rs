@@ -289,6 +289,12 @@ pub fn generate_bindings(build: &FinalBuildConfiguration, output_directory: &Pat
         cc_build.flag(&sysroot);
     }
 
+    if let Some(skia_extra_cflags) = cargo::env_var("SKIA_EXTRA_CFLAGS") {
+        for flag in skia_extra_cflags.split_whitespace() {
+            builder = builder.clang_arg(flag);
+        }
+    }
+
     println!("COMPILING BINDINGS: {:?}", build.binding_sources);
     // we add skia-bindings later on.
     cc_build.cargo_metadata(false);
