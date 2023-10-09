@@ -94,6 +94,9 @@ pub struct FinalBuildConfiguration {
 
     /// An optional target sysroot
     pub sysroot: Option<String>,
+
+    /// An optional directory that tells clang where gcc library and headers are located.
+    pub clang_gcc_install_dir: Option<String>,
 }
 
 impl FinalBuildConfiguration {
@@ -108,6 +111,8 @@ impl FinalBuildConfiguration {
         // `SDKTARGETSYSROOT` is the environment variable set in Yocto Linux SDKs when
         // cross-compiling.
         let sysroot = cargo::env_var("SDKTARGETSYSROOT").or_else(|| cargo::env_var("SDKROOT"));
+
+        let clang_gcc_install_dir = cargo::env_var("CLANG_GCC_INSTALL_DIR");
 
         let mut builder = GnArgsBuilder::new(&build.target, use_system_libraries);
 
@@ -193,6 +198,10 @@ impl FinalBuildConfiguration {
                 builder.cflag(format!("--sysroot={sysroot}"));
             }
 
+            if let Some(install_dir) = &clang_gcc_install_dir {
+                builder.cflag(format!("--gcc-install-dir={install_dir}"));
+            }
+
             let jpeg_sys_cflags: Vec<String>;
             if cfg!(feature = "use-system-jpeg-turbo") {
                 let paths = cargo::env_var("DEP_JPEG_INCLUDE").expect("mozjpeg-sys include path");
@@ -234,6 +243,7 @@ impl FinalBuildConfiguration {
             use_system_libraries,
             target: build.target.clone(),
             sysroot,
+            clang_gcc_install_dir,
         }
     }
 }

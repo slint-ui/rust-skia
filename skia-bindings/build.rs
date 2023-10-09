@@ -41,6 +41,7 @@ fn main() -> Result<(), io::Error> {
                 &source_dir,
                 cargo::target(),
                 None,
+                None,
             );
         } else {
             println!("STARTING OFFLINE BUILD");
@@ -66,6 +67,7 @@ fn main() -> Result<(), io::Error> {
                     .sysroot
                     .as_ref()
                     .map(AsRef::as_ref),
+                final_build_configuration.clang_gcc_install_dir.clone(),
             );
         }
     } else {
@@ -108,6 +110,7 @@ fn main() -> Result<(), io::Error> {
                     .sysroot
                     .as_ref()
                     .map(AsRef::as_ref),
+                final_build_configuration.clang_gcc_install_dir.clone(),
             );
         }
     };
@@ -154,6 +157,7 @@ fn generate_bindings(
     skia_source_dir: &std::path::Path,
     target: Target,
     sysroot: Option<&str>,
+    clang_gcc_install_dir: Option<String>,
 ) {
     // Emit the ninja definitions, to help debug build consistency.
     skia_bindgen::definitions::save_definitions(&definitions, &binaries_config.output_directory)
@@ -165,6 +169,7 @@ fn generate_bindings(
         &binaries_config.output_directory,
         target,
         sysroot,
+        clang_gcc_install_dir,
     );
 }
 

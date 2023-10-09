@@ -72,6 +72,7 @@ pub fn generate_bindings(
     output_directory: &Path,
     target: Target,
     sysroot: Option<&str>,
+    gcc_install_dir: Option<String>,
 ) {
     let mut builder = bindgen::Builder::default()
         .generate_comments(false)
@@ -221,7 +222,7 @@ pub fn generate_bindings(
 
     // Platform specific arguments and flags.
     {
-        let (bindgen, cc) = platform::bindgen_and_cc_args(&target, sysroot);
+        let (bindgen, cc) = platform::bindgen_and_cc_args(&target, sysroot, gcc_install_dir);
         bindgen_args.extend(bindgen);
         cc_args.extend(cc);
     }

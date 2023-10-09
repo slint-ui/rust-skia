@@ -23,8 +23,12 @@ pub fn gn_args(config: &BuildConfiguration, mut builder: GnArgsBuilder) -> Vec<(
     builder.into_gn_args()
 }
 
-pub fn bindgen_and_cc_args(target: &Target, sysroot: Option<&str>) -> (Vec<String>, Vec<String>) {
-    let mut builder = BindgenArgsBuilder::new(sysroot);
+pub fn bindgen_and_cc_args(
+    target: &Target,
+    sysroot: Option<&str>,
+    gcc_install_dir: Option<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut builder = BindgenArgsBuilder::new(sysroot, gcc_install_dir);
     details(target).bindgen_args(target, &mut builder);
     builder.into_bindgen_and_cc_args()
 }
@@ -152,14 +156,16 @@ pub struct BindgenArgsBuilder {
     /// sysroot if set explicitly.
     sysroot: Option<String>,
     sysroot_prefix: String,
+    gcc_install_dir: Option<String>,
     bindgen_clang_args: Vec<String>,
 }
 
 impl BindgenArgsBuilder {
-    pub fn new(sysroot: Option<&str>) -> Self {
+    pub fn new(sysroot: Option<&str>, gcc_install_dir: Option<String>) -> Self {
         Self {
             sysroot: sysroot.map(|s| s.into()),
             sysroot_prefix: "--sysroot=".into(),
+            gcc_install_dir,
             bindgen_clang_args: Vec::new(),
         }
     }
@@ -199,6 +205,11 @@ impl BindgenArgsBuilder {
             let sysroot_arg = format!("{}{}", self.sysroot_prefix, sysroot);
             self.arg(&sysroot_arg);
             cc_build_args.push(sysroot_arg);
+        }
+
+        if let Some(gcc_install_dir) = &self.gcc_install_dir {
+            let gcc_install_dir_arg = format!("--gcc-install-dir={}", gcc_install_dir);
+            self.arg(&gcc_install_dir_arg);
         }
 
         (self.bindgen_clang_args.into_iter().collect(), cc_build_args)

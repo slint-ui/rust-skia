@@ -87,3 +87,6 @@ It's possible to cross compile Skia and the Rust bindings for different architec
  * `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-poky-linux-g++`
  * `RUSTFLAGS="-Clink-args=--sysroot=$SDKTARGETSYSROOT"`
 
+Depending on your how clang is configured, the build might fail locating C++ headers from the gcc installation such as `cstddef`. This indicates that clang
+failed with its heuristics to locate your gcc cross compiler. Set the `CLANG_GCC_INSTALL_PREFIX` environment variable to the prefix where your cross gcc is installed,
+which will be used to pass [`--gcc-install-dir`](https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-gcc-install-dir) to invocations of clang.
