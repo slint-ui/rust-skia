@@ -162,6 +162,12 @@ impl FinalBuildConfiguration {
                 builder.arg("skia_use_direct3d", yes());
             }
 
+            if features[feature::GRAPHITE] {
+                builder
+                    .arg("skia_enable_graphite", yes())
+                    .arg("skia_use_dawn", yes());
+            }
+
             // further flags that limit the components of Skia debug builds.
             if build.skia_debug {
                 builder

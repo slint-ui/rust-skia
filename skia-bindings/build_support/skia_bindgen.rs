@@ -63,6 +63,10 @@ impl Configuration {
             if features.gpu() {
                 sources.push("src/gpu.cpp".into());
             }
+            if features[feature::GRAPHITE] {
+                sources.push("src/graphite.cpp".into());
+                sources.push("src/webgpu.cpp".into());
+            }
             if features[feature::TEXTLAYOUT] {
                 sources.extend(vec!["src/shaper.cpp".into(), "src/paragraph.cpp".into()]);
             }
@@ -214,6 +218,24 @@ pub fn generate_bindings(
 
     bindgen_args.push(format!("-I{}", include_path.display()));
     cc_build.include(include_path);
+
+    // Dawn ships its WebGPU headers under `third_party/externals/dawn/include`,
+    // and Dawn's build emits additional generated headers (including `dawn/webgpu.h`,
+    // which is `#include`d from the stock `webgpu/webgpu.h`) to
+    // `<out>/gen/third_party/dawn/include`. Both paths need to be visible to
+    // bindgen and the bindings cc step.
+    if build.features[feature::GRAPHITE] {
+        let dawn_include = include_path.join("third_party/externals/dawn/include");
+        let dawn_gen_include = output_directory.join("gen/third_party/dawn/include");
+        for path in [&dawn_include, &dawn_gen_include] {
+            bindgen_args.push(format!("-I{}", path.display()));
+            cc_build.include(path);
+        }
+        builder = builder
+            .allowlist_function("wgpu.*")
+            .allowlist_type("WGPU.*")
+            .allowlist_var("WGPU_.*");
+    }
 
     for (name, value) in &build.definitions {
         match value {
@@ -491,6 +513,8 @@ const OPAQUE_TYPES: &[&str] = &[
     "sksg::BlurImageFilter",
     // m147
     "std::unordered_map.*",
+    // skgpu::graphite::Recording exposes std::unordered_set members
+    "std::unordered_set.*",
 ];
 
 const BLOCKLISTED_TYPES: &[&str] = &[
@@ -515,7 +539,6 @@ const BLOCKLISTED_TYPES: &[&str] = &[
     "std::array.*",
     // m115 unused Linux
     "std::__uset_hashtable.*",
-    "std::unordered_set.*",
     // m115 unused Windows
     "std::_List_unchecked.*",
     "std::_Hash.*",
@@ -776,6 +799,10 @@ const ENUM_REWRITES: &[EnumEntry] = &[
     ("CompressionLevel", rewrite::k_opt_xxx),
     // m148: SkShapers::CT::LineBreakMode
     ("LineBreakMode", rewrite::k_xxx),
+    // graphite (skgpu::CallbackResult, skgpu::graphite::SyncToCpu, MarkFrameBoundary)
+    ("CallbackResult", rewrite::k_xxx),
+    ("SyncToCpu", rewrite::k_xxx),
+    ("MarkFrameBoundary", rewrite::k_xxx),
 ];
 
 pub(crate) mod rewrite {
