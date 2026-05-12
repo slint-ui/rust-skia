@@ -4,4 +4,5 @@ target/
 /cmake-build-debug/
 .direnv/
 /tmp/
+/graphite-output.png
 
