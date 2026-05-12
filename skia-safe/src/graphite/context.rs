@@ -3,7 +3,7 @@ use std::fmt;
 use skia_bindings::{self as sb, skgpu_graphite_Context};
 
 use super::{BackendApi, InsertStatus, Recorder, RecorderOptions, Recording, SubmitInfo};
-use crate::{prelude::*, Surface};
+use crate::{prelude::*, IRect, ImageInfo, Surface};
 
 pub type Context = RefHandle<skgpu_graphite_Context>;
 unsafe_send_sync!(Context);
@@ -52,6 +52,43 @@ impl Context {
                 self.native_mut(),
                 recording.native_mut(),
                 target_surface.map_or(core::ptr::null_mut(), |s| s.native_mut()),
+            )
+        }
+    }
+
+    /// Reads a rectangle of pixels from a Graphite-backed Surface into a
+    /// caller-supplied buffer. Internally schedules an asynchronous read
+    /// against `Context::asyncRescaleAndReadPixels` and then drives any
+    /// pending GPU work to completion via `submit(SyncToCpu::Yes)`, returning
+    /// once the callback has copied the data (or signalled failure).
+    ///
+    /// `dst_pixels` must be at least `dst_row_bytes * dst_info.height()` bytes
+    /// long. Returns `false` if the buffer is too small, if the underlying
+    /// read fails, or if the submit fails.
+    pub fn read_pixels(
+        &mut self,
+        surface: &Surface,
+        dst_info: &ImageInfo,
+        dst_pixels: &mut [u8],
+        dst_row_bytes: usize,
+        src: impl Into<IRect>,
+    ) -> bool {
+        let height: usize = dst_info.height().max(0) as usize;
+        if dst_row_bytes
+            .checked_mul(height)
+            .map_or(true, |needed| dst_pixels.len() < needed)
+        {
+            return false;
+        }
+        let src = src.into();
+        unsafe {
+            sb::C_SkgpuGraphite_Context_readPixelsBlocking(
+                self.native_mut(),
+                surface.native(),
+                dst_info.native(),
+                src.native(),
+                dst_pixels.as_mut_ptr() as _,
+                dst_row_bytes,
             )
         }
     }

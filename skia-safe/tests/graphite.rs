@@ -8,7 +8,7 @@
 
 use skia_safe::{
     graphite::{self, dawn::DawnDevice},
-    AlphaType, Color, ColorType, ImageInfo,
+    AlphaType, Color, ColorType, IRect, ImageInfo,
 };
 
 #[test]
@@ -38,12 +38,12 @@ fn end_to_end_draw_red() {
     let status = ctx.insert_recording(&mut recording, Some(&mut surface));
     assert_eq!(status, graphite::InsertStatus::Success, "insert_recording");
 
-    assert!(ctx.submit(&graphite::SubmitInfo::sync_to_cpu()), "submit");
-
-    // Pixel-level verification needs Graphite's asynchronous read-back API
-    // (`Context::asyncRescaleAndReadPixels`), which isn't wrapped yet.
-    // For now `Surface::read_pixels` on a Graphite-backed Surface returns
-    // false; we just call it for shape and ignore the result.
+    // `Context::read_pixels` drives the async read + submit to completion
+    // internally, so an explicit `submit` isn't needed before this call.
     let mut pixels = vec![0u8; 32 * 32 * 4];
-    let _ = surface.read_pixels(&info, &mut pixels, 32 * 4, (0, 0));
+    let ok = ctx.read_pixels(&surface, &info, &mut pixels, 32 * 4, IRect::new(0, 0, 32, 32));
+    assert!(ok, "read_pixels");
+
+    // Premultiplied red = (R=255, G=0, B=0, A=255).
+    assert_eq!(&pixels[0..4], &[255, 0, 0, 255], "pixel(0,0) should be red");
 }

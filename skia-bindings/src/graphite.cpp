@@ -7,7 +7,9 @@
 
 #include "bindings.h"
 
+#include "include/core/SkImage.h"
 #include "include/core/SkImageInfo.h"
+#include "include/core/SkRect.h"
 #include "include/core/SkSurface.h"
 #include "include/core/SkSurfaceProps.h"
 #include "include/gpu/GpuTypes.h"
@@ -17,6 +19,9 @@
 #include "include/gpu/graphite/Recorder.h"
 #include "include/gpu/graphite/Recording.h"
 #include "include/gpu/graphite/Surface.h"
+
+#include <cstring>
+#include <memory>
 
 namespace skgr = skgpu::graphite;
 
@@ -194,4 +199,73 @@ extern "C" SkSurface* C_SkgpuGraphite_Surfaces_RenderTarget(
     sk_sp<SkSurface> surface = SkSurfaces::RenderTarget(
             recorder, *imageInfo, mipmapped, surfaceProps);
     return surface.release();
+}
+
+//
+// Blocking async readback
+//
+
+namespace {
+
+struct ReadPixelsState {
+    void* dstPixels;
+    size_t dstRowBytes;
+    int width;
+    int height;
+    size_t bytesPerPixel;
+    bool success;
+};
+
+void read_pixels_callback(SkImage::ReadPixelsContext context,
+                          std::unique_ptr<const SkImage::AsyncReadResult> result) {
+    auto* state = static_cast<ReadPixelsState*>(context);
+    if (!result || result->count() == 0) {
+        state->success = false;
+        return;
+    }
+    const auto* srcRow = static_cast<const uint8_t*>(result->data(0));
+    size_t srcRowBytes = result->rowBytes(0);
+    auto* dstRow = static_cast<uint8_t*>(state->dstPixels);
+    size_t bytesPerRow = static_cast<size_t>(state->width) * state->bytesPerPixel;
+    for (int y = 0; y < state->height; ++y) {
+        std::memcpy(dstRow, srcRow, bytesPerRow);
+        srcRow += srcRowBytes;
+        dstRow += state->dstRowBytes;
+    }
+    state->success = true;
+}
+
+} // namespace
+
+// Schedules a `Surface`-sourced read of `srcRect` into a caller-supplied
+// buffer, submits any pending GPU work synchronously, and returns once the
+// callback has copied the data (or signalled failure).
+extern "C" bool C_SkgpuGraphite_Context_readPixelsBlocking(
+        skgr::Context* ctx,
+        const SkSurface* src,
+        const SkImageInfo* dstInfo,
+        const SkIRect* srcRect,
+        void* dstPixels,
+        size_t dstRowBytes) {
+    ReadPixelsState state = {
+            dstPixels,
+            dstRowBytes,
+            dstInfo->width(),
+            dstInfo->height(),
+            static_cast<size_t>(dstInfo->bytesPerPixel()),
+            false,
+    };
+    ctx->asyncRescaleAndReadPixels(src,
+                                   *dstInfo,
+                                   *srcRect,
+                                   SkImage::RescaleGamma::kSrc,
+                                   SkImage::RescaleMode::kNearest,
+                                   read_pixels_callback,
+                                   &state);
+    skgr::SubmitInfo submitInfo;
+    submitInfo.fSync = skgr::SyncToCpu::kYes;
+    if (!ctx->submit(submitInfo)) {
+        return false;
+    }
+    return state.success;
 }
