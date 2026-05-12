@@ -2706,6 +2706,61 @@ macro_rules! install_abort_stubs {
     };
 }
 
+/// Wraps an existing [`wgpu::Instance`] / [`wgpu::Adapter`] / [`wgpu::Device`]
+/// / [`wgpu::Queue`] in WGPU C handles compatible with Graphite. The proc
+/// table is installed automatically (first-caller-wins, so this is safe to
+/// call after another install).
+///
+/// The caller keeps its original wgpu objects — we clone them, and wgpu's
+/// types are Arc-internally, so the clone shares the underlying GPU device
+/// with the caller's renderer. After this call:
+///
+/// - Pass the returned [`BackendContext`](super::dawn::BackendContext) to
+///   [`Context::new_dawn`](super::Context::new_dawn) to build a Graphite
+///   Context on the user-provided device.
+/// - The user's `wgpu::Device` and `wgpu::Queue` remain fully usable for
+///   other rendering work. Skia's Context and the user's wgpu work share
+///   the same queue and can interoperate via textures/buffers extracted
+///   from one and wrapped into the other.
+///
+/// This is the entry point for "use my existing wgpu device" interop, e.g.
+/// when integrating Skia/Graphite into an application that already drives
+/// its rendering through the [`wgpu`] crate.
+pub fn install_and_wrap(
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+) -> crate::graphite::dawn::BackendContext {
+    static PROCS: std::sync::OnceLock<DawnProcTable> = std::sync::OnceLock::new();
+    let procs = PROCS.get_or_init(wgpu_proc_table);
+    // SAFETY: `procs` is `'static` (held by `PROCS`).
+    unsafe { crate::graphite::dawn::install_proc_table(procs) };
+
+    let instance_handle = Resource::into_handle(InstanceData {
+        inner: instance.clone(),
+    }) as sb::WGPUInstance;
+    // We hand AdapterData out only for parity, but `BackendContext` doesn't
+    // include an adapter handle, so this lives only inside DeviceData as a
+    // keep-alive.
+    let device_handle = Resource::into_handle(DeviceData {
+        inner: device.clone(),
+        queue: queue.clone(),
+        _adapter: adapter,
+        dummy_vertex_buffer: std::sync::OnceLock::new(),
+    }) as sb::WGPUDevice;
+    let queue_handle = Resource::into_handle(QueueData {
+        inner: queue,
+        _device: device,
+    }) as sb::WGPUQueue;
+
+    crate::graphite::dawn::BackendContext {
+        instance: instance_handle,
+        device: device_handle,
+        queue: queue_handle,
+    }
+}
+
 /// Builds a [`DawnProcTable`] whose entries route to wgpu.
 ///
 /// Every entry is populated: real thunks for what we've implemented, and

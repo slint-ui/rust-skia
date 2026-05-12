@@ -91,6 +91,53 @@ fn end_to_end_draw_red_via_wgpu() {
     assert_eq!(&pixels[0..4], &[255, 0, 0, 255], "pixel(0,0) should be red");
 }
 
+/// Builds a Graphite Context from an externally-created wgpu Instance /
+/// Adapter / Device / Queue (i.e. the integration pattern an application
+/// that already drives its own rendering through `wgpu` would use).
+/// Verifies that the wrapped device is usable by Graphite: clears the
+/// surface to red and reads the pixel back.
+#[test]
+fn build_context_from_external_wgpu() {
+    // Create wgpu objects ourselves, the way an application would.
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())).ok()
+    else {
+        eprintln!("Skipping: no wgpu adapter available");
+        return;
+    };
+    let (device, queue) =
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            .expect("request_device");
+
+    // Hand them to Graphite. This installs the proc table and manufactures
+    // C handles backed by the same wgpu objects.
+    let backend = graphite::wgpu_backend::install_and_wrap(instance, adapter, device, queue);
+
+    let mut ctx = unsafe {
+        graphite::Context::new_dawn(&backend, &graphite::ContextOptions::default())
+    }
+    .expect("Context::new_dawn from external wgpu");
+    assert_eq!(ctx.backend(), graphite::BackendApi::Dawn);
+
+    let mut recorder = ctx
+        .make_recorder(&graphite::RecorderOptions::default())
+        .expect("make_recorder");
+
+    let info = ImageInfo::new((32, 32), ColorType::RGBA8888, AlphaType::Premul, None);
+    let mut surface = graphite::surfaces::render_target(&mut recorder, &info, None, None)
+        .expect("render_target");
+    surface.canvas().clear(Color::RED);
+
+    let mut recording = recorder.snap().expect("snap");
+    let status = ctx.insert_recording(&mut recording, Some(&mut surface));
+    assert_eq!(status, graphite::InsertStatus::Success);
+
+    let mut pixels = vec![0u8; 32 * 32 * 4];
+    let ok = ctx.read_pixels(&surface, &info, &mut pixels, 32 * 4, IRect::new(0, 0, 32, 32));
+    assert!(ok);
+    assert_eq!(&pixels[0..4], &[255, 0, 0, 255], "pixel(0,0) should be red");
+}
+
 /// Like `end_to_end_draw_red_via_wgpu` but also draws a green rectangle —
 /// exercises the full render-pipeline/bind-group/draw path.
 #[test]
