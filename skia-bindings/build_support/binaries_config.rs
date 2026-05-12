@@ -25,6 +25,7 @@ pub mod lib {
     pub const SK_RESOURCES: &str = "skresources";
     pub const SK_UNICODE_CORE: &str = "skunicode_core";
     pub const SK_UNICODE_ICU: &str = "skunicode_icu";
+    pub const DAWN_COMBINED: &str = "dawn_combined";
 }
 
 /// The configuration of the resulting binaries.
@@ -41,6 +42,11 @@ pub struct BinariesConfiguration {
 
     /// The static Skia libraries built by ninja that dependent projects need to link with.
     pub ninja_built_libraries: Vec<String>,
+
+    /// Static libraries that are built as transitive ninja side-effects of the
+    /// libraries above (so they aren't valid ninja targets by short name) but
+    /// that dependent projects still need to link with.
+    pub extra_static_libs: Vec<String>,
 
     /// Static libraries that are generated in the binding process dependent projects need to link
     /// with.
@@ -101,11 +107,21 @@ impl BinariesConfiguration {
         ninja_built_libraries.push(lib::SKIA.into());
         binding_libraries.push(lib::SKIA_BINDINGS.into());
 
+        // Static libraries built as side-effects of `skia` (so ninja doesn't
+        // accept them as standalone targets) but that we still need cargo to
+        // link. Skia's `build_dawn.py` combines Tint's objects into
+        // `libdawn_combined.a`, so we don't link Tint separately.
+        let mut extra_static_libs = Vec::new();
+        if features[feature::GRAPHITE] {
+            extra_static_libs.push(lib::DAWN_COMBINED.into());
+        }
+
         BinariesConfiguration {
             features: features.clone(),
             output_directory,
             link_libraries,
             ninja_built_libraries,
+            extra_static_libs,
             binding_libraries,
             binding_files,
             additional_files,
@@ -151,6 +167,7 @@ impl BinariesConfiguration {
         // On Linux, the order is significant, first the static libraries we built, and then
         // the system libraries.
         cargo::add_static_link_libs(&target, self.built_libraries(true));
+        cargo::add_static_link_libs(&target, self.extra_static_libs.iter());
         cargo::add_link_libs(&self.link_libraries);
     }
 

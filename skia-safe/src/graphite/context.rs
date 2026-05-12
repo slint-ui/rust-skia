@@ -36,7 +36,7 @@ impl Context {
     }
 
     pub fn submit(&mut self, info: &SubmitInfo) -> bool {
-        unsafe { sb::C_SkgpuGraphiteContext_submit(self.native_mut(), info) }
+        unsafe { sb::C_SkgpuGraphiteContext_submit(self.native_mut(), info.native()) }
     }
 
     /// Replays a Recording against the optional target Surface and queues
