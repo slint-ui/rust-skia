@@ -10,10 +10,13 @@
 
 #![cfg(all(feature = "graphite", feature = "wgpu"))]
 
-use skia_safe::graphite::{
-    self,
-    dawn::{install_proc_table, DawnDevice},
-    wgpu_backend::wgpu_proc_table,
+use skia_safe::{
+    graphite::{
+        self,
+        dawn::{install_proc_table, DawnDevice},
+        wgpu_backend::wgpu_proc_table,
+    },
+    AlphaType, Color, ColorType, IRect, ImageInfo,
 };
 
 #[test]
@@ -46,4 +49,48 @@ fn dawn_setup_through_wgpu_proc_table() {
         .expect("Context::new_dawn through wgpu");
     assert_eq!(ctx.backend(), graphite::BackendApi::Dawn);
     eprintln!("Context::new_dawn succeeded through wgpu: {ctx:?}");
+}
+
+/// Aspirational test: draws red onto a Graphite-backed surface entirely
+/// through the wgpu-routed proc table. Currently fails on
+/// `commandEncoderBeginRenderPass` and the render pipeline / pass chain,
+/// which haven't been thunked yet. Marked `#[ignore]` until the rest of
+/// the WebGPU surface lands; run with
+/// `cargo test ... -- --ignored end_to_end_draw_red_via_wgpu` to probe
+/// progress.
+#[test]
+#[ignore]
+fn end_to_end_draw_red_via_wgpu() {
+    static PROCS: std::sync::OnceLock<skia_bindings::DawnProcTable> = std::sync::OnceLock::new();
+    let procs = PROCS.get_or_init(wgpu_proc_table);
+    unsafe { install_proc_table(procs) };
+
+    let Some(dawn) = DawnDevice::new() else {
+        eprintln!("Skipping: no wgpu-compatible GPU available");
+        return;
+    };
+
+    let backend = dawn.backend_context();
+    let mut ctx = unsafe {
+        graphite::Context::new_dawn(&backend, &graphite::ContextOptions::default())
+    }
+    .expect("Context::new_dawn");
+    let mut recorder = ctx
+        .make_recorder(&graphite::RecorderOptions::default())
+        .expect("make_recorder");
+
+    let info = ImageInfo::new((32, 32), ColorType::RGBA8888, AlphaType::Premul, None);
+    let mut surface = graphite::surfaces::render_target(&mut recorder, &info, None, None)
+        .expect("render_target");
+
+    surface.canvas().clear(Color::RED);
+
+    let mut recording = recorder.snap().expect("snap");
+    let status = ctx.insert_recording(&mut recording, Some(&mut surface));
+    assert_eq!(status, graphite::InsertStatus::Success);
+
+    let mut pixels = vec![0u8; 32 * 32 * 4];
+    let ok = ctx.read_pixels(&surface, &info, &mut pixels, 32 * 4, IRect::new(0, 0, 32, 32));
+    assert!(ok, "read_pixels through wgpu");
+    assert_eq!(&pixels[0..4], &[255, 0, 0, 255], "pixel(0,0) should be red");
 }

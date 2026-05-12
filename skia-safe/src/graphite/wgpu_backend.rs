@@ -146,6 +146,16 @@ struct CommandBufferData {
     _device: wgpu::Device,
 }
 
+struct TextureData {
+    inner: wgpu::Texture,
+    _device: wgpu::Device,
+}
+
+struct TextureViewData {
+    inner: wgpu::TextureView,
+    _texture: wgpu::Texture,
+}
+
 /// Borrows a `WGPUStringView` as a Rust `&str`. Handles WebGPU's sentinel
 /// values: `WGPU_STRLEN` (== `usize::MAX`) means "data is a C string, find
 /// the NUL terminator yourself"; the empty view (null data, zero length) and
@@ -1250,6 +1260,207 @@ unsafe extern "C" fn command_buffer_set_label(
 ) {
 }
 
+fn convert_texture_dimension(d: sb::WGPUTextureDimension) -> wgpu::TextureDimension {
+    match d {
+        sb::WGPUTextureDimension::WGPUTextureDimension_1D => wgpu::TextureDimension::D1,
+        sb::WGPUTextureDimension::WGPUTextureDimension_3D => wgpu::TextureDimension::D3,
+        _ => wgpu::TextureDimension::D2,
+    }
+}
+
+unsafe extern "C" fn device_create_texture(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPUTextureDescriptor,
+) -> sb::WGPUTexture {
+    let device_data = Resource::<DeviceData>::inner(device as _);
+    if descriptor.is_null() {
+        return ptr::null_mut();
+    }
+    let d = &*descriptor;
+    let label = string_view_as_str(d.label);
+
+    let view_formats_slice: &[sb::WGPUTextureFormat] = if d.viewFormatCount == 0
+        || d.viewFormats.is_null()
+    {
+        &[]
+    } else {
+        std::slice::from_raw_parts(d.viewFormats, d.viewFormatCount)
+    };
+    let view_formats: Vec<wgpu::TextureFormat> = view_formats_slice
+        .iter()
+        .map(|f| convert_texture_format(*f))
+        .collect();
+
+    let texture = device_data.inner.create_texture(&wgpu::TextureDescriptor {
+        label: if label.is_empty() { None } else { Some(label) },
+        size: wgpu::Extent3d {
+            width: d.size.width,
+            height: d.size.height,
+            depth_or_array_layers: d.size.depthOrArrayLayers,
+        },
+        mip_level_count: d.mipLevelCount,
+        sample_count: d.sampleCount,
+        dimension: convert_texture_dimension(d.dimension),
+        format: convert_texture_format(d.format),
+        usage: wgpu::TextureUsages::from_bits_truncate(d.usage as u32),
+        view_formats: &view_formats,
+    });
+
+    Resource::into_handle(TextureData {
+        inner: texture,
+        _device: device_data.inner.clone(),
+    }) as sb::WGPUTexture
+}
+
+unsafe extern "C" fn texture_add_ref(handle: sb::WGPUTexture) {
+    Resource::<TextureData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn texture_release(handle: sb::WGPUTexture) {
+    Resource::<TextureData>::release(handle as _);
+}
+
+unsafe extern "C" fn texture_destroy(handle: sb::WGPUTexture) {
+    if handle.is_null() {
+        return;
+    }
+    Resource::<TextureData>::inner(handle as _).inner.destroy();
+}
+
+unsafe extern "C" fn texture_set_label(_handle: sb::WGPUTexture, _label: sb::WGPUStringView) {}
+
+unsafe extern "C" fn texture_get_width(handle: sb::WGPUTexture) -> u32 {
+    Resource::<TextureData>::inner(handle as _).inner.width()
+}
+
+unsafe extern "C" fn texture_get_height(handle: sb::WGPUTexture) -> u32 {
+    Resource::<TextureData>::inner(handle as _).inner.height()
+}
+
+unsafe extern "C" fn texture_get_depth_or_array_layers(handle: sb::WGPUTexture) -> u32 {
+    Resource::<TextureData>::inner(handle as _)
+        .inner
+        .depth_or_array_layers()
+}
+
+unsafe extern "C" fn texture_get_mip_level_count(handle: sb::WGPUTexture) -> u32 {
+    Resource::<TextureData>::inner(handle as _).inner.mip_level_count()
+}
+
+unsafe extern "C" fn texture_get_sample_count(handle: sb::WGPUTexture) -> u32 {
+    Resource::<TextureData>::inner(handle as _).inner.sample_count()
+}
+
+unsafe extern "C" fn texture_get_dimension(handle: sb::WGPUTexture) -> sb::WGPUTextureDimension {
+    match Resource::<TextureData>::inner(handle as _).inner.dimension() {
+        wgpu::TextureDimension::D1 => sb::WGPUTextureDimension::WGPUTextureDimension_1D,
+        wgpu::TextureDimension::D2 => sb::WGPUTextureDimension::WGPUTextureDimension_2D,
+        wgpu::TextureDimension::D3 => sb::WGPUTextureDimension::WGPUTextureDimension_3D,
+    }
+}
+
+unsafe extern "C" fn texture_get_usage(handle: sb::WGPUTexture) -> sb::WGPUTextureUsage {
+    Resource::<TextureData>::inner(handle as _).inner.usage().bits() as sb::WGPUTextureUsage
+}
+
+unsafe extern "C" fn texture_get_format(handle: sb::WGPUTexture) -> sb::WGPUTextureFormat {
+    let format = Resource::<TextureData>::inner(handle as _).inner.format();
+    // Inverse mapping for the common cases. We hand back Undefined for
+    // anything we don't reverse-map; Skia's code paths that consume this
+    // mostly compare against a small set of formats it cares about.
+    convert_texture_format_back(format)
+}
+
+fn convert_texture_format_back(f: wgpu::TextureFormat) -> sb::WGPUTextureFormat {
+    use wgpu::TextureFormat as R;
+    use sb::WGPUTextureFormat as W;
+    match f {
+        R::R8Unorm => W::WGPUTextureFormat_R8Unorm,
+        R::R8Snorm => W::WGPUTextureFormat_R8Snorm,
+        R::R8Uint => W::WGPUTextureFormat_R8Uint,
+        R::R8Sint => W::WGPUTextureFormat_R8Sint,
+        R::R16Float => W::WGPUTextureFormat_R16Float,
+        R::Rg8Unorm => W::WGPUTextureFormat_RG8Unorm,
+        R::R32Float => W::WGPUTextureFormat_R32Float,
+        R::Rg16Float => W::WGPUTextureFormat_RG16Float,
+        R::Rgba8Unorm => W::WGPUTextureFormat_RGBA8Unorm,
+        R::Rgba8UnormSrgb => W::WGPUTextureFormat_RGBA8UnormSrgb,
+        R::Bgra8Unorm => W::WGPUTextureFormat_BGRA8Unorm,
+        R::Bgra8UnormSrgb => W::WGPUTextureFormat_BGRA8UnormSrgb,
+        R::Rg32Float => W::WGPUTextureFormat_RG32Float,
+        R::Rgba16Float => W::WGPUTextureFormat_RGBA16Float,
+        R::Rgba32Float => W::WGPUTextureFormat_RGBA32Float,
+        R::Depth16Unorm => W::WGPUTextureFormat_Depth16Unorm,
+        R::Depth24Plus => W::WGPUTextureFormat_Depth24Plus,
+        R::Depth24PlusStencil8 => W::WGPUTextureFormat_Depth24PlusStencil8,
+        R::Depth32Float => W::WGPUTextureFormat_Depth32Float,
+        R::Depth32FloatStencil8 => W::WGPUTextureFormat_Depth32FloatStencil8,
+        R::Stencil8 => W::WGPUTextureFormat_Stencil8,
+        _ => W::WGPUTextureFormat_Undefined,
+    }
+}
+
+unsafe extern "C" fn texture_create_view(
+    handle: sb::WGPUTexture,
+    descriptor: *const sb::WGPUTextureViewDescriptor,
+) -> sb::WGPUTextureView {
+    let texture_data = Resource::<TextureData>::inner(handle as _);
+    let desc = if descriptor.is_null() {
+        wgpu::TextureViewDescriptor::default()
+    } else {
+        let d = &*descriptor;
+        let label = string_view_as_str(d.label);
+        wgpu::TextureViewDescriptor {
+            label: if label.is_empty() { None } else { Some(label) },
+            format: if d.format == sb::WGPUTextureFormat::WGPUTextureFormat_Undefined {
+                None
+            } else {
+                Some(convert_texture_format(d.format))
+            },
+            dimension: if d.dimension == sb::WGPUTextureViewDimension::WGPUTextureViewDimension_Undefined {
+                None
+            } else {
+                Some(convert_view_dimension(d.dimension))
+            },
+            usage: None,
+            aspect: wgpu::TextureAspect::All,
+            base_mip_level: d.baseMipLevel,
+            // WGPU_MIP_LEVEL_COUNT_UNDEFINED == u32::MAX -> "all remaining levels".
+            mip_level_count: if d.mipLevelCount == 0 || d.mipLevelCount == u32::MAX {
+                None
+            } else {
+                Some(d.mipLevelCount)
+            },
+            base_array_layer: d.baseArrayLayer,
+            // WGPU_ARRAY_LAYER_COUNT_UNDEFINED == u32::MAX -> "all remaining layers".
+            array_layer_count: if d.arrayLayerCount == 0 || d.arrayLayerCount == u32::MAX {
+                None
+            } else {
+                Some(d.arrayLayerCount)
+            },
+        }
+    };
+    let view = texture_data.inner.create_view(&desc);
+    Resource::into_handle(TextureViewData {
+        inner: view,
+        _texture: texture_data.inner.clone(),
+    }) as sb::WGPUTextureView
+}
+
+unsafe extern "C" fn texture_view_add_ref(handle: sb::WGPUTextureView) {
+    Resource::<TextureViewData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn texture_view_release(handle: sb::WGPUTextureView) {
+    Resource::<TextureViewData>::release(handle as _);
+}
+
+unsafe extern "C" fn texture_view_set_label(
+    _handle: sb::WGPUTextureView,
+    _label: sb::WGPUStringView,
+) {
+}
+
 unsafe extern "C" fn queue_on_submitted_work_done(
     queue: sb::WGPUQueue,
     callback_info: sb::WGPUQueueWorkDoneCallbackInfo,
@@ -1463,6 +1674,24 @@ pub fn wgpu_proc_table() -> DawnProcTable {
     table.commandBufferSetLabel = Some(command_buffer_set_label);
 
     table.queueOnSubmittedWorkDone = Some(queue_on_submitted_work_done);
+
+    table.deviceCreateTexture = Some(device_create_texture);
+    table.textureAddRef = Some(texture_add_ref);
+    table.textureRelease = Some(texture_release);
+    table.textureDestroy = Some(texture_destroy);
+    table.textureSetLabel = Some(texture_set_label);
+    table.textureGetWidth = Some(texture_get_width);
+    table.textureGetHeight = Some(texture_get_height);
+    table.textureGetDepthOrArrayLayers = Some(texture_get_depth_or_array_layers);
+    table.textureGetMipLevelCount = Some(texture_get_mip_level_count);
+    table.textureGetSampleCount = Some(texture_get_sample_count);
+    table.textureGetDimension = Some(texture_get_dimension);
+    table.textureGetUsage = Some(texture_get_usage);
+    table.textureGetFormat = Some(texture_get_format);
+    table.textureCreateView = Some(texture_create_view);
+    table.textureViewAddRef = Some(texture_view_add_ref);
+    table.textureViewRelease = Some(texture_view_release);
+    table.textureViewSetLabel = Some(texture_view_set_label);
 
     table.deviceCreatePipelineLayout = Some(device_create_pipeline_layout);
     table.pipelineLayoutAddRef = Some(pipeline_layout_add_ref);
