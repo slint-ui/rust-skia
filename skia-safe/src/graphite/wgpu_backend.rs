@@ -108,7 +108,27 @@ struct QueueData {
 }
 
 struct ShaderModuleData {
-    _inner: wgpu::ShaderModule,
+    inner: wgpu::ShaderModule,
+    _device: wgpu::Device,
+}
+
+struct BindGroupLayoutData {
+    inner: wgpu::BindGroupLayout,
+    _device: wgpu::Device,
+}
+
+struct SamplerData {
+    inner: wgpu::Sampler,
+    _device: wgpu::Device,
+}
+
+struct BufferData {
+    inner: wgpu::Buffer,
+    _device: wgpu::Device,
+}
+
+struct PipelineLayoutData {
+    inner: wgpu::PipelineLayout,
     _device: wgpu::Device,
 }
 
@@ -367,7 +387,7 @@ unsafe extern "C" fn device_create_shader_module(
     });
 
     Resource::into_handle(ShaderModuleData {
-        _inner: module,
+        inner: module,
         _device: device_data.inner.clone(),
     }) as sb::WGPUShaderModule
 }
@@ -589,6 +609,542 @@ unsafe extern "C" fn adapter_get_format_capabilities(
 }
 
 //
+// Format / dimension helpers
+//
+
+fn convert_view_dimension(d: sb::WGPUTextureViewDimension) -> wgpu::TextureViewDimension {
+    use sb::WGPUTextureViewDimension as W;
+    match d {
+        W::WGPUTextureViewDimension_1D => wgpu::TextureViewDimension::D1,
+        W::WGPUTextureViewDimension_2D => wgpu::TextureViewDimension::D2,
+        W::WGPUTextureViewDimension_2DArray => wgpu::TextureViewDimension::D2Array,
+        W::WGPUTextureViewDimension_Cube => wgpu::TextureViewDimension::Cube,
+        W::WGPUTextureViewDimension_CubeArray => wgpu::TextureViewDimension::CubeArray,
+        W::WGPUTextureViewDimension_3D => wgpu::TextureViewDimension::D3,
+        // Undefined / unknown: treat as D2 (most common default).
+        _ => wgpu::TextureViewDimension::D2,
+    }
+}
+
+/// Maps the WebGPU C `WGPUTextureFormat` enum to wgpu's `TextureFormat`. Covers
+/// the formats Graphite/Skia is known to request; falls back to RGBA8 for
+/// anything else with a stderr note, since most uncommon formats would lead to
+/// pipeline-creation failures further down the line anyway.
+fn convert_texture_format(f: sb::WGPUTextureFormat) -> wgpu::TextureFormat {
+    use sb::WGPUTextureFormat as W;
+    use wgpu::TextureFormat as R;
+    match f {
+        W::WGPUTextureFormat_R8Unorm => R::R8Unorm,
+        W::WGPUTextureFormat_R8Snorm => R::R8Snorm,
+        W::WGPUTextureFormat_R8Uint => R::R8Uint,
+        W::WGPUTextureFormat_R8Sint => R::R8Sint,
+        W::WGPUTextureFormat_R16Uint => R::R16Uint,
+        W::WGPUTextureFormat_R16Sint => R::R16Sint,
+        W::WGPUTextureFormat_R16Float => R::R16Float,
+        W::WGPUTextureFormat_RG8Unorm => R::Rg8Unorm,
+        W::WGPUTextureFormat_RG8Snorm => R::Rg8Snorm,
+        W::WGPUTextureFormat_RG8Uint => R::Rg8Uint,
+        W::WGPUTextureFormat_RG8Sint => R::Rg8Sint,
+        W::WGPUTextureFormat_R32Float => R::R32Float,
+        W::WGPUTextureFormat_R32Uint => R::R32Uint,
+        W::WGPUTextureFormat_R32Sint => R::R32Sint,
+        W::WGPUTextureFormat_RG16Uint => R::Rg16Uint,
+        W::WGPUTextureFormat_RG16Sint => R::Rg16Sint,
+        W::WGPUTextureFormat_RG16Float => R::Rg16Float,
+        W::WGPUTextureFormat_RGBA8Unorm => R::Rgba8Unorm,
+        W::WGPUTextureFormat_RGBA8UnormSrgb => R::Rgba8UnormSrgb,
+        W::WGPUTextureFormat_RGBA8Snorm => R::Rgba8Snorm,
+        W::WGPUTextureFormat_RGBA8Uint => R::Rgba8Uint,
+        W::WGPUTextureFormat_RGBA8Sint => R::Rgba8Sint,
+        W::WGPUTextureFormat_BGRA8Unorm => R::Bgra8Unorm,
+        W::WGPUTextureFormat_BGRA8UnormSrgb => R::Bgra8UnormSrgb,
+        W::WGPUTextureFormat_RG32Float => R::Rg32Float,
+        W::WGPUTextureFormat_RG32Uint => R::Rg32Uint,
+        W::WGPUTextureFormat_RG32Sint => R::Rg32Sint,
+        W::WGPUTextureFormat_RGBA16Uint => R::Rgba16Uint,
+        W::WGPUTextureFormat_RGBA16Sint => R::Rgba16Sint,
+        W::WGPUTextureFormat_RGBA16Float => R::Rgba16Float,
+        W::WGPUTextureFormat_RGBA32Float => R::Rgba32Float,
+        W::WGPUTextureFormat_RGBA32Uint => R::Rgba32Uint,
+        W::WGPUTextureFormat_RGBA32Sint => R::Rgba32Sint,
+        W::WGPUTextureFormat_Depth16Unorm => R::Depth16Unorm,
+        W::WGPUTextureFormat_Depth24Plus => R::Depth24Plus,
+        W::WGPUTextureFormat_Depth24PlusStencil8 => R::Depth24PlusStencil8,
+        W::WGPUTextureFormat_Depth32Float => R::Depth32Float,
+        W::WGPUTextureFormat_Depth32FloatStencil8 => R::Depth32FloatStencil8,
+        W::WGPUTextureFormat_Stencil8 => R::Stencil8,
+        other => {
+            eprintln!(
+                "wgpu_backend: unhandled WGPUTextureFormat {other:?}; falling back to Rgba8Unorm"
+            );
+            R::Rgba8Unorm
+        }
+    }
+}
+
+//
+// BindGroupLayout
+//
+
+unsafe extern "C" fn device_create_bind_group_layout(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPUBindGroupLayoutDescriptor,
+) -> sb::WGPUBindGroupLayout {
+    let device_data = Resource::<DeviceData>::inner(device as _);
+    if descriptor.is_null() {
+        return ptr::null_mut();
+    }
+    let desc = &*descriptor;
+
+    let entries_slice = if desc.entryCount == 0 || desc.entries.is_null() {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(desc.entries, desc.entryCount)
+    };
+
+    let mut rust_entries = Vec::with_capacity(entries_slice.len());
+    for entry in entries_slice {
+        let visibility = wgpu::ShaderStages::from_bits_truncate(entry.visibility as u32);
+        let count = if entry.bindingArraySize > 1 {
+            core::num::NonZeroU32::new(entry.bindingArraySize)
+        } else {
+            None
+        };
+
+        use sb::WGPUBufferBindingType as Buf;
+        use sb::WGPUSamplerBindingType as Smp;
+        use sb::WGPUStorageTextureAccess as Stg;
+        use sb::WGPUTextureSampleType as Tex;
+
+        let ty = if entry.buffer.type_ != Buf::WGPUBufferBindingType_BindingNotUsed
+            && entry.buffer.type_ != Buf::WGPUBufferBindingType_Undefined
+        {
+            let buf_ty = match entry.buffer.type_ {
+                Buf::WGPUBufferBindingType_Storage => {
+                    wgpu::BufferBindingType::Storage { read_only: false }
+                }
+                Buf::WGPUBufferBindingType_ReadOnlyStorage => {
+                    wgpu::BufferBindingType::Storage { read_only: true }
+                }
+                _ => wgpu::BufferBindingType::Uniform,
+            };
+            wgpu::BindingType::Buffer {
+                ty: buf_ty,
+                has_dynamic_offset: entry.buffer.hasDynamicOffset != 0,
+                min_binding_size: core::num::NonZeroU64::new(entry.buffer.minBindingSize),
+            }
+        } else if entry.sampler.type_ != Smp::WGPUSamplerBindingType_BindingNotUsed
+            && entry.sampler.type_ != Smp::WGPUSamplerBindingType_Undefined
+        {
+            wgpu::BindingType::Sampler(match entry.sampler.type_ {
+                Smp::WGPUSamplerBindingType_NonFiltering => wgpu::SamplerBindingType::NonFiltering,
+                Smp::WGPUSamplerBindingType_Comparison => wgpu::SamplerBindingType::Comparison,
+                _ => wgpu::SamplerBindingType::Filtering,
+            })
+        } else if entry.texture.sampleType != Tex::WGPUTextureSampleType_BindingNotUsed
+            && entry.texture.sampleType != Tex::WGPUTextureSampleType_Undefined
+        {
+            wgpu::BindingType::Texture {
+                sample_type: match entry.texture.sampleType {
+                    Tex::WGPUTextureSampleType_UnfilterableFloat => {
+                        wgpu::TextureSampleType::Float { filterable: false }
+                    }
+                    Tex::WGPUTextureSampleType_Depth => wgpu::TextureSampleType::Depth,
+                    Tex::WGPUTextureSampleType_Sint => wgpu::TextureSampleType::Sint,
+                    Tex::WGPUTextureSampleType_Uint => wgpu::TextureSampleType::Uint,
+                    _ => wgpu::TextureSampleType::Float { filterable: true },
+                },
+                view_dimension: convert_view_dimension(entry.texture.viewDimension),
+                multisampled: entry.texture.multisampled != 0,
+            }
+        } else if entry.storageTexture.access != Stg::WGPUStorageTextureAccess_BindingNotUsed
+            && entry.storageTexture.access != Stg::WGPUStorageTextureAccess_Undefined
+        {
+            wgpu::BindingType::StorageTexture {
+                access: match entry.storageTexture.access {
+                    Stg::WGPUStorageTextureAccess_ReadOnly => wgpu::StorageTextureAccess::ReadOnly,
+                    Stg::WGPUStorageTextureAccess_ReadWrite => {
+                        wgpu::StorageTextureAccess::ReadWrite
+                    }
+                    _ => wgpu::StorageTextureAccess::WriteOnly,
+                },
+                format: convert_texture_format(entry.storageTexture.format),
+                view_dimension: convert_view_dimension(entry.storageTexture.viewDimension),
+            }
+        } else {
+            // No active binding type — skip rather than poison the layout.
+            continue;
+        };
+
+        rust_entries.push(wgpu::BindGroupLayoutEntry {
+            binding: entry.binding,
+            visibility,
+            ty,
+            count,
+        });
+    }
+
+    let label = string_view_as_str(desc.label);
+    let layout = device_data
+        .inner
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: if label.is_empty() { None } else { Some(label) },
+            entries: &rust_entries,
+        });
+
+    Resource::into_handle(BindGroupLayoutData {
+        inner: layout,
+        _device: device_data.inner.clone(),
+    }) as sb::WGPUBindGroupLayout
+}
+
+unsafe extern "C" fn bind_group_layout_add_ref(handle: sb::WGPUBindGroupLayout) {
+    Resource::<BindGroupLayoutData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn bind_group_layout_release(handle: sb::WGPUBindGroupLayout) {
+    Resource::<BindGroupLayoutData>::release(handle as _);
+}
+
+unsafe extern "C" fn bind_group_layout_set_label(
+    _handle: sb::WGPUBindGroupLayout,
+    _label: sb::WGPUStringView,
+) {
+}
+
+//
+// Sampler
+//
+
+fn convert_address_mode(m: sb::WGPUAddressMode) -> wgpu::AddressMode {
+    use sb::WGPUAddressMode as W;
+    match m {
+        W::WGPUAddressMode_Repeat => wgpu::AddressMode::Repeat,
+        W::WGPUAddressMode_MirrorRepeat => wgpu::AddressMode::MirrorRepeat,
+        _ => wgpu::AddressMode::ClampToEdge,
+    }
+}
+
+fn convert_filter_mode(m: sb::WGPUFilterMode) -> wgpu::FilterMode {
+    match m {
+        sb::WGPUFilterMode::WGPUFilterMode_Linear => wgpu::FilterMode::Linear,
+        _ => wgpu::FilterMode::Nearest,
+    }
+}
+
+fn convert_mipmap_filter(m: sb::WGPUMipmapFilterMode) -> wgpu::MipmapFilterMode {
+    match m {
+        sb::WGPUMipmapFilterMode::WGPUMipmapFilterMode_Linear => wgpu::MipmapFilterMode::Linear,
+        _ => wgpu::MipmapFilterMode::Nearest,
+    }
+}
+
+fn convert_compare_function(c: sb::WGPUCompareFunction) -> Option<wgpu::CompareFunction> {
+    use sb::WGPUCompareFunction as W;
+    Some(match c {
+        W::WGPUCompareFunction_Never => wgpu::CompareFunction::Never,
+        W::WGPUCompareFunction_Less => wgpu::CompareFunction::Less,
+        W::WGPUCompareFunction_Equal => wgpu::CompareFunction::Equal,
+        W::WGPUCompareFunction_LessEqual => wgpu::CompareFunction::LessEqual,
+        W::WGPUCompareFunction_Greater => wgpu::CompareFunction::Greater,
+        W::WGPUCompareFunction_NotEqual => wgpu::CompareFunction::NotEqual,
+        W::WGPUCompareFunction_GreaterEqual => wgpu::CompareFunction::GreaterEqual,
+        W::WGPUCompareFunction_Always => wgpu::CompareFunction::Always,
+        _ => return None,
+    })
+}
+
+unsafe extern "C" fn device_create_sampler(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPUSamplerDescriptor,
+) -> sb::WGPUSampler {
+    let device_data = Resource::<DeviceData>::inner(device as _);
+    let (label, desc) = if descriptor.is_null() {
+        ("", None)
+    } else {
+        let d = &*descriptor;
+        (string_view_as_str(d.label), Some(d))
+    };
+
+    let wgpu_desc = match desc {
+        Some(d) => wgpu::SamplerDescriptor {
+            label: if label.is_empty() { None } else { Some(label) },
+            address_mode_u: convert_address_mode(d.addressModeU),
+            address_mode_v: convert_address_mode(d.addressModeV),
+            address_mode_w: convert_address_mode(d.addressModeW),
+            mag_filter: convert_filter_mode(d.magFilter),
+            min_filter: convert_filter_mode(d.minFilter),
+            mipmap_filter: convert_mipmap_filter(d.mipmapFilter),
+            lod_min_clamp: d.lodMinClamp,
+            lod_max_clamp: d.lodMaxClamp,
+            compare: convert_compare_function(d.compare),
+            anisotropy_clamp: d.maxAnisotropy.max(1),
+            border_color: None,
+        },
+        None => wgpu::SamplerDescriptor::default(),
+    };
+
+    let sampler = device_data.inner.create_sampler(&wgpu_desc);
+    Resource::into_handle(SamplerData {
+        inner: sampler,
+        _device: device_data.inner.clone(),
+    }) as sb::WGPUSampler
+}
+
+unsafe extern "C" fn sampler_add_ref(handle: sb::WGPUSampler) {
+    Resource::<SamplerData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn sampler_release(handle: sb::WGPUSampler) {
+    Resource::<SamplerData>::release(handle as _);
+}
+
+unsafe extern "C" fn sampler_set_label(_handle: sb::WGPUSampler, _label: sb::WGPUStringView) {}
+
+//
+// Buffer
+//
+
+unsafe extern "C" fn device_create_buffer(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPUBufferDescriptor,
+) -> sb::WGPUBuffer {
+    let device_data = Resource::<DeviceData>::inner(device as _);
+    if descriptor.is_null() {
+        return ptr::null_mut();
+    }
+    let d = &*descriptor;
+    let label = string_view_as_str(d.label);
+    let usage = wgpu::BufferUsages::from_bits_truncate(d.usage as u32);
+    let buffer = device_data.inner.create_buffer(&wgpu::BufferDescriptor {
+        label: if label.is_empty() { None } else { Some(label) },
+        size: d.size,
+        usage,
+        mapped_at_creation: d.mappedAtCreation != 0,
+    });
+    Resource::into_handle(BufferData {
+        inner: buffer,
+        _device: device_data.inner.clone(),
+    }) as sb::WGPUBuffer
+}
+
+unsafe extern "C" fn buffer_add_ref(handle: sb::WGPUBuffer) {
+    Resource::<BufferData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn buffer_release(handle: sb::WGPUBuffer) {
+    Resource::<BufferData>::release(handle as _);
+}
+
+unsafe extern "C" fn buffer_destroy(handle: sb::WGPUBuffer) {
+    if handle.is_null() {
+        return;
+    }
+    Resource::<BufferData>::inner(handle as _).inner.destroy();
+}
+
+unsafe extern "C" fn buffer_get_size(handle: sb::WGPUBuffer) -> u64 {
+    Resource::<BufferData>::inner(handle as _).inner.size()
+}
+
+unsafe extern "C" fn buffer_get_usage(handle: sb::WGPUBuffer) -> sb::WGPUBufferUsage {
+    Resource::<BufferData>::inner(handle as _).inner.usage().bits() as sb::WGPUBufferUsage
+}
+
+unsafe extern "C" fn buffer_set_label(_handle: sb::WGPUBuffer, _label: sb::WGPUStringView) {}
+
+fn buffer_slice_range(buffer: &wgpu::Buffer, offset: usize, size: usize) -> (u64, u64) {
+    let start = offset as u64;
+    let end = if size == usize::MAX || (offset == 0 && size == 0) {
+        buffer.size()
+    } else {
+        start.saturating_add(size as u64).min(buffer.size())
+    };
+    (start, end)
+}
+
+unsafe extern "C" fn buffer_get_mapped_range(
+    handle: sb::WGPUBuffer,
+    offset: usize,
+    size: usize,
+) -> *mut core::ffi::c_void {
+    let buffer = &Resource::<BufferData>::inner(handle as _).inner;
+    let (start, end) = buffer_slice_range(buffer, offset, size);
+    let mut view = buffer.slice(start..end).get_mapped_range_mut();
+    let ptr = view.slice(..).as_raw_element_ptr().as_ptr() as *mut core::ffi::c_void;
+    // We hand the raw pointer back to Skia; the BufferViewMut's drop would
+    // unregister it from wgpu's bookkeeping prematurely, so we leak it and
+    // rely on `bufferUnmap` to do the actual release.
+    core::mem::forget(view);
+    ptr
+}
+
+unsafe extern "C" fn buffer_get_const_mapped_range(
+    handle: sb::WGPUBuffer,
+    offset: usize,
+    size: usize,
+) -> *const core::ffi::c_void {
+    let buffer = &Resource::<BufferData>::inner(handle as _).inner;
+    let (start, end) = buffer_slice_range(buffer, offset, size);
+    let view = buffer.slice(start..end).get_mapped_range();
+    let ptr = (*view).as_ptr() as *const core::ffi::c_void;
+    core::mem::forget(view);
+    ptr
+}
+
+unsafe extern "C" fn buffer_unmap(handle: sb::WGPUBuffer) {
+    if handle.is_null() {
+        return;
+    }
+    Resource::<BufferData>::inner(handle as _).inner.unmap();
+}
+
+unsafe extern "C" fn buffer_map_async(
+    handle: sb::WGPUBuffer,
+    mode: sb::WGPUMapMode,
+    offset: usize,
+    size: usize,
+    callback_info: sb::WGPUBufferMapCallbackInfo,
+) -> sb::WGPUFuture {
+    let buffer_data = Resource::<BufferData>::inner(handle as _);
+    let buffer = &buffer_data.inner;
+    let (start, end) = buffer_slice_range(buffer, offset, size);
+    // WGPUMapMode is a bitflag (Dawn's webgpu.h: Read = 0x1, Write = 0x2).
+    let map_mode = if mode & 0x1 != 0 {
+        wgpu::MapMode::Read
+    } else {
+        wgpu::MapMode::Write
+    };
+
+    // Bridge the async map to a synchronous block_on by stashing the result
+    // in a one-shot channel that the callback fills from wgpu's thread.
+    let (tx, rx) = std::sync::mpsc::channel();
+    buffer
+        .slice(start..end)
+        .map_async(map_mode, move |result| {
+            let _ = tx.send(result);
+        });
+
+    // Drive submitted GPU work to completion so the map callback can fire.
+    buffer_data
+        ._device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .ok();
+
+    let status = match rx.recv().unwrap_or(Err(wgpu::BufferAsyncError)) {
+        Ok(()) => sb::WGPUMapAsyncStatus::WGPUMapAsyncStatus_Success,
+        Err(_) => sb::WGPUMapAsyncStatus::WGPUMapAsyncStatus_Error,
+    };
+
+    if let Some(callback) = callback_info.callback {
+        let message = sb::WGPUStringView {
+            data: ptr::null(),
+            length: 0,
+        };
+        callback(
+            status,
+            message,
+            callback_info.userdata1,
+            callback_info.userdata2,
+        );
+    }
+
+    sb::WGPUFuture { id: 0 }
+}
+
+//
+// queueWriteBuffer
+//
+
+unsafe extern "C" fn queue_write_buffer(
+    queue: sb::WGPUQueue,
+    buffer: sb::WGPUBuffer,
+    offset: u64,
+    data: *const core::ffi::c_void,
+    size: usize,
+) {
+    let queue_data = Resource::<QueueData>::inner(queue as _);
+    let buffer_data = Resource::<BufferData>::inner(buffer as _);
+    if data.is_null() || size == 0 {
+        return;
+    }
+    let slice = std::slice::from_raw_parts(data as *const u8, size);
+    queue_data.inner.write_buffer(&buffer_data.inner, offset, slice);
+}
+
+unsafe extern "C" fn queue_submit(
+    queue: sb::WGPUQueue,
+    _command_count: usize,
+    _commands: *const sb::WGPUCommandBuffer,
+) {
+    let _ = Resource::<QueueData>::inner(queue as _);
+    // TODO: collect command buffers and call queue.submit(...). Stubbed for
+    // now so the rest of the path keeps progressing.
+}
+
+//
+// PipelineLayout
+//
+
+unsafe extern "C" fn device_create_pipeline_layout(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPUPipelineLayoutDescriptor,
+) -> sb::WGPUPipelineLayout {
+    let device_data = Resource::<DeviceData>::inner(device as _);
+    if descriptor.is_null() {
+        return ptr::null_mut();
+    }
+    let d = &*descriptor;
+
+    let bg_handles = if d.bindGroupLayoutCount == 0 || d.bindGroupLayouts.is_null() {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(d.bindGroupLayouts, d.bindGroupLayoutCount)
+    };
+    let bg_layouts: Vec<Option<&wgpu::BindGroupLayout>> = bg_handles
+        .iter()
+        .map(|h| {
+            if h.is_null() {
+                None
+            } else {
+                Some(&Resource::<BindGroupLayoutData>::inner(*h as _).inner)
+            }
+        })
+        .collect();
+
+    let label = string_view_as_str(d.label);
+    let layout = device_data
+        .inner
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: if label.is_empty() { None } else { Some(label) },
+            bind_group_layouts: &bg_layouts,
+            immediate_size: d.immediateSize,
+        });
+
+    Resource::into_handle(PipelineLayoutData {
+        inner: layout,
+        _device: device_data.inner.clone(),
+    }) as sb::WGPUPipelineLayout
+}
+
+unsafe extern "C" fn pipeline_layout_add_ref(handle: sb::WGPUPipelineLayout) {
+    Resource::<PipelineLayoutData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn pipeline_layout_release(handle: sb::WGPUPipelineLayout) {
+    Resource::<PipelineLayoutData>::release(handle as _);
+}
+
+unsafe extern "C" fn pipeline_layout_set_label(
+    _handle: sb::WGPUPipelineLayout,
+    _label: sb::WGPUStringView,
+) {
+}
+
+//
 // Proc table assembly
 //
 
@@ -668,6 +1224,36 @@ pub fn wgpu_proc_table() -> DawnProcTable {
     table.deviceSetLoggingCallback = Some(device_set_logging_callback);
     table.deviceSetLabel = Some(device_set_label);
     table.adapterGetFormatCapabilities = Some(adapter_get_format_capabilities);
+
+    table.deviceCreateBindGroupLayout = Some(device_create_bind_group_layout);
+    table.bindGroupLayoutAddRef = Some(bind_group_layout_add_ref);
+    table.bindGroupLayoutRelease = Some(bind_group_layout_release);
+    table.bindGroupLayoutSetLabel = Some(bind_group_layout_set_label);
+
+    table.deviceCreateSampler = Some(device_create_sampler);
+    table.samplerAddRef = Some(sampler_add_ref);
+    table.samplerRelease = Some(sampler_release);
+    table.samplerSetLabel = Some(sampler_set_label);
+
+    table.deviceCreateBuffer = Some(device_create_buffer);
+    table.bufferAddRef = Some(buffer_add_ref);
+    table.bufferRelease = Some(buffer_release);
+    table.bufferDestroy = Some(buffer_destroy);
+    table.bufferGetSize = Some(buffer_get_size);
+    table.bufferGetUsage = Some(buffer_get_usage);
+    table.bufferSetLabel = Some(buffer_set_label);
+    table.bufferGetMappedRange = Some(buffer_get_mapped_range);
+    table.bufferGetConstMappedRange = Some(buffer_get_const_mapped_range);
+    table.bufferUnmap = Some(buffer_unmap);
+    table.bufferMapAsync = Some(buffer_map_async);
+
+    table.queueWriteBuffer = Some(queue_write_buffer);
+    table.queueSubmit = Some(queue_submit);
+
+    table.deviceCreatePipelineLayout = Some(device_create_pipeline_layout);
+    table.pipelineLayoutAddRef = Some(pipeline_layout_add_ref);
+    table.pipelineLayoutRelease = Some(pipeline_layout_release);
+    table.pipelineLayoutSetLabel = Some(pipeline_layout_set_label);
 
     table
 }
