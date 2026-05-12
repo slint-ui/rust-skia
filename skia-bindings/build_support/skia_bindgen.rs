@@ -65,6 +65,7 @@ impl Configuration {
             }
             if features[feature::GRAPHITE] {
                 sources.push("src/graphite.cpp".into());
+                sources.push("src/graphite_dawn.cpp".into());
                 sources.push("src/webgpu.cpp".into());
             }
             if features[feature::TEXTLAYOUT] {

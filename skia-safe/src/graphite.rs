@@ -10,6 +10,7 @@
 //! (Dawn, and platform-specific helpers) will be added in a follow-up.
 
 mod context;
+pub mod dawn;
 mod options;
 mod recorder;
 mod recording;
