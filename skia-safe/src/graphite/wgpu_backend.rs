@@ -3568,6 +3568,38 @@ pub fn install_and_wrap(
     }
 }
 
+/// Wraps an externally-owned [`wgpu::Texture`] as a Dawn-style
+/// `WGPUTexture` handle suitable for [`super::dawn::backend_texture_from_wgpu_texture`].
+///
+/// The returned handle holds a strong reference to the texture. Release it
+/// with [`release_wgpu_texture`] when the wrapping `BackendTexture` (and any
+/// derived `Surface`/`Image`) is no longer in use.
+///
+/// `device` should be the same `wgpu::Device` that was used to construct the
+/// `BackendContext` via [`install_and_wrap`].
+pub fn wrap_wgpu_texture(
+    texture: wgpu::Texture,
+    device: wgpu::Device,
+) -> sb::WGPUTexture {
+    Resource::into_handle(TextureData {
+        inner: texture,
+        _device: device,
+    }) as sb::WGPUTexture
+}
+
+/// Releases a handle previously returned by [`wrap_wgpu_texture`]. Decrements
+/// the refcount; when it reaches zero the underlying `wgpu::Texture` is
+/// dropped (which is itself reference-counted on the wgpu side, so the GPU
+/// resource only frees once no other clones remain).
+///
+/// # Safety
+///
+/// `handle` must have come from [`wrap_wgpu_texture`] and must not be used
+/// again after this call.
+pub unsafe fn release_wgpu_texture(handle: sb::WGPUTexture) {
+    Resource::<TextureData>::release(handle as _);
+}
+
 /// Builds a [`DawnProcTable`] whose entries route to wgpu.
 ///
 /// Every entry is populated: real thunks for what we've implemented, and
