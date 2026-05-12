@@ -62,6 +62,7 @@ struct State {
     surface_config: wgpu::SurfaceConfiguration,
     skia_context: graphite::Context,
     recorder: graphite::Recorder,
+    frames: u64,
 }
 
 #[cfg(all(feature = "graphite", feature = "wgpu"))]
@@ -140,6 +141,10 @@ impl ApplicationHandler for App {
             .make_recorder(&graphite::RecorderOptions::default())
             .expect("make_recorder");
 
+        eprintln!(
+            "graphite-wgpu-window: {:?} swapchain {}x{}",
+            surface_config.format, surface_config.width, surface_config.height
+        );
         self.state = Some(State {
             window,
             device,
@@ -148,6 +153,7 @@ impl ApplicationHandler for App {
             surface_config,
             skia_context,
             recorder,
+            frames: 0,
         });
         self.state.as_ref().unwrap().window.request_redraw();
     }
@@ -235,6 +241,10 @@ impl State {
         // Submit any work the recording deferred and present.
         self.queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
         frame.present();
+        self.frames += 1;
+        if self.frames == 1 {
+            eprintln!("graphite-wgpu-window: rendered first frame");
+        }
     }
 }
 
