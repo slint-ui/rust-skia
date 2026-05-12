@@ -57,7 +57,6 @@ struct App {
 struct State {
     window: Arc<Window>,
     device: wgpu::Device,
-    queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
     skia_context: graphite::Context,
@@ -145,10 +144,12 @@ impl ApplicationHandler for App {
             "graphite-wgpu-window: {:?} swapchain {}x{}",
             surface_config.format, surface_config.width, surface_config.height
         );
+        // `queue` is unused after install_and_wrap: Graphite owns its own
+        // clone and submits through the proc table.
+        drop(queue);
         self.state = Some(State {
             window,
             device,
-            queue,
             surface,
             surface_config,
             skia_context,
@@ -232,14 +233,17 @@ impl State {
             if status != graphite::InsertStatus::Success {
                 eprintln!("insert_recording: {status:?}");
             }
+            // Force the Graphite context to actually submit all queued
+            // work — without this, insert_recording buffers commands until
+            // the next read_pixels/submit/etc., and frame.present() ends
+            // up showing an undrawn (black) swapchain texture.
+            self.skia_context.submit(&graphite::SubmitInfo::default());
         }
 
         drop(skia_surface);
         drop(backend_tex);
         unsafe { wgpu_backend::release_wgpu_texture(wgpu_handle) };
 
-        // Submit any work the recording deferred and present.
-        self.queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
         frame.present();
         self.frames += 1;
         if self.frames == 1 {
