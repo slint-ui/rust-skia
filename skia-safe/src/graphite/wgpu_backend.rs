@@ -100,6 +100,12 @@ struct DeviceData {
     inner: wgpu::Device,
     queue: wgpu::Queue,
     _adapter: wgpu::Adapter,
+    /// A dummy buffer used to satisfy wgpu's validator for vertex-buffer
+    /// slots that Skia declares as "unused" placeholders (`stepMode =
+    /// Undefined`, stride 0, no attributes). The WebGPU spec considers
+    /// such slots optional to bind, but wgpu requires *some* buffer to
+    /// be set if a slot appears in the pipeline's vertex layout.
+    dummy_vertex_buffer: std::sync::OnceLock<wgpu::Buffer>,
 }
 
 struct QueueData {
@@ -154,6 +160,24 @@ struct TextureData {
 struct TextureViewData {
     inner: wgpu::TextureView,
     _texture: wgpu::Texture,
+}
+
+struct RenderPipelineData {
+    inner: wgpu::RenderPipeline,
+    /// Slot indices that the pipeline declared but Skia marked as
+    /// "placeholder" (stepMode Undefined / VertexBufferNotUsed, no
+    /// attributes). wgpu requires these slots to have a buffer bound
+    /// before draws, so we auto-bind a per-device dummy on set_pipeline.
+    placeholder_slots: Vec<u32>,
+    /// Reference to the parent device so set_pipeline can fetch its
+    /// dummy vertex buffer.
+    device_handle: sb::WGPUDevice,
+    _device: wgpu::Device,
+}
+
+struct BindGroupData {
+    inner: wgpu::BindGroup,
+    _device: wgpu::Device,
 }
 
 /// A live render pass. wgpu's `RenderPass` borrows from its parent
@@ -328,6 +352,7 @@ unsafe extern "C" fn adapter_request_device(
                 inner: device,
                 queue,
                 _adapter: adapter_data.inner.clone(),
+                dummy_vertex_buffer: std::sync::OnceLock::new(),
             }) as sb::WGPUDevice;
             (
                 sb::WGPURequestDeviceStatus::WGPURequestDeviceStatus_Success,
@@ -438,6 +463,593 @@ unsafe extern "C" fn shader_module_set_label(
     _label: sb::WGPUStringView,
 ) {
     // Labels are diagnostic and ignored.
+}
+
+//
+// Render pipeline
+//
+
+fn convert_vertex_format(f: sb::WGPUVertexFormat) -> wgpu::VertexFormat {
+    use sb::WGPUVertexFormat as W;
+    use wgpu::VertexFormat as R;
+    match f {
+        W::WGPUVertexFormat_Uint8 => R::Uint8,
+        W::WGPUVertexFormat_Uint8x2 => R::Uint8x2,
+        W::WGPUVertexFormat_Uint8x4 => R::Uint8x4,
+        W::WGPUVertexFormat_Sint8 => R::Sint8,
+        W::WGPUVertexFormat_Sint8x2 => R::Sint8x2,
+        W::WGPUVertexFormat_Sint8x4 => R::Sint8x4,
+        W::WGPUVertexFormat_Unorm8 => R::Unorm8,
+        W::WGPUVertexFormat_Unorm8x2 => R::Unorm8x2,
+        W::WGPUVertexFormat_Unorm8x4 => R::Unorm8x4,
+        W::WGPUVertexFormat_Snorm8 => R::Snorm8,
+        W::WGPUVertexFormat_Snorm8x2 => R::Snorm8x2,
+        W::WGPUVertexFormat_Snorm8x4 => R::Snorm8x4,
+        W::WGPUVertexFormat_Uint16 => R::Uint16,
+        W::WGPUVertexFormat_Uint16x2 => R::Uint16x2,
+        W::WGPUVertexFormat_Uint16x4 => R::Uint16x4,
+        W::WGPUVertexFormat_Sint16 => R::Sint16,
+        W::WGPUVertexFormat_Sint16x2 => R::Sint16x2,
+        W::WGPUVertexFormat_Sint16x4 => R::Sint16x4,
+        W::WGPUVertexFormat_Unorm16 => R::Unorm16,
+        W::WGPUVertexFormat_Unorm16x2 => R::Unorm16x2,
+        W::WGPUVertexFormat_Unorm16x4 => R::Unorm16x4,
+        W::WGPUVertexFormat_Snorm16 => R::Snorm16,
+        W::WGPUVertexFormat_Snorm16x2 => R::Snorm16x2,
+        W::WGPUVertexFormat_Snorm16x4 => R::Snorm16x4,
+        W::WGPUVertexFormat_Float16 => R::Float16,
+        W::WGPUVertexFormat_Float16x2 => R::Float16x2,
+        W::WGPUVertexFormat_Float16x4 => R::Float16x4,
+        W::WGPUVertexFormat_Float32 => R::Float32,
+        W::WGPUVertexFormat_Float32x2 => R::Float32x2,
+        W::WGPUVertexFormat_Float32x3 => R::Float32x3,
+        W::WGPUVertexFormat_Float32x4 => R::Float32x4,
+        W::WGPUVertexFormat_Uint32 => R::Uint32,
+        W::WGPUVertexFormat_Uint32x2 => R::Uint32x2,
+        W::WGPUVertexFormat_Uint32x3 => R::Uint32x3,
+        W::WGPUVertexFormat_Uint32x4 => R::Uint32x4,
+        W::WGPUVertexFormat_Sint32 => R::Sint32,
+        W::WGPUVertexFormat_Sint32x2 => R::Sint32x2,
+        W::WGPUVertexFormat_Sint32x3 => R::Sint32x3,
+        W::WGPUVertexFormat_Sint32x4 => R::Sint32x4,
+        _ => {
+            eprintln!("wgpu_backend: unhandled WGPUVertexFormat {f:?}; falling back to Float32");
+            R::Float32
+        }
+    }
+}
+
+fn convert_primitive_topology(t: sb::WGPUPrimitiveTopology) -> wgpu::PrimitiveTopology {
+    use sb::WGPUPrimitiveTopology as W;
+    match t {
+        W::WGPUPrimitiveTopology_PointList => wgpu::PrimitiveTopology::PointList,
+        W::WGPUPrimitiveTopology_LineList => wgpu::PrimitiveTopology::LineList,
+        W::WGPUPrimitiveTopology_LineStrip => wgpu::PrimitiveTopology::LineStrip,
+        W::WGPUPrimitiveTopology_TriangleStrip => wgpu::PrimitiveTopology::TriangleStrip,
+        _ => wgpu::PrimitiveTopology::TriangleList,
+    }
+}
+
+fn convert_index_format(f: sb::WGPUIndexFormat) -> Option<wgpu::IndexFormat> {
+    match f {
+        sb::WGPUIndexFormat::WGPUIndexFormat_Uint16 => Some(wgpu::IndexFormat::Uint16),
+        sb::WGPUIndexFormat::WGPUIndexFormat_Uint32 => Some(wgpu::IndexFormat::Uint32),
+        _ => None,
+    }
+}
+
+fn convert_front_face(f: sb::WGPUFrontFace) -> wgpu::FrontFace {
+    match f {
+        sb::WGPUFrontFace::WGPUFrontFace_CW => wgpu::FrontFace::Cw,
+        _ => wgpu::FrontFace::Ccw,
+    }
+}
+
+fn convert_cull_mode(c: sb::WGPUCullMode) -> Option<wgpu::Face> {
+    match c {
+        sb::WGPUCullMode::WGPUCullMode_Front => Some(wgpu::Face::Front),
+        sb::WGPUCullMode::WGPUCullMode_Back => Some(wgpu::Face::Back),
+        _ => None,
+    }
+}
+
+fn convert_step_mode(m: sb::WGPUVertexStepMode) -> wgpu::VertexStepMode {
+    match m {
+        sb::WGPUVertexStepMode::WGPUVertexStepMode_Instance => wgpu::VertexStepMode::Instance,
+        _ => wgpu::VertexStepMode::Vertex,
+    }
+}
+
+fn convert_blend_operation(o: sb::WGPUBlendOperation) -> wgpu::BlendOperation {
+    use sb::WGPUBlendOperation as W;
+    match o {
+        W::WGPUBlendOperation_Subtract => wgpu::BlendOperation::Subtract,
+        W::WGPUBlendOperation_ReverseSubtract => wgpu::BlendOperation::ReverseSubtract,
+        W::WGPUBlendOperation_Min => wgpu::BlendOperation::Min,
+        W::WGPUBlendOperation_Max => wgpu::BlendOperation::Max,
+        _ => wgpu::BlendOperation::Add,
+    }
+}
+
+fn convert_blend_factor(f: sb::WGPUBlendFactor) -> wgpu::BlendFactor {
+    use sb::WGPUBlendFactor as W;
+    use wgpu::BlendFactor as R;
+    match f {
+        W::WGPUBlendFactor_Zero => R::Zero,
+        W::WGPUBlendFactor_One => R::One,
+        W::WGPUBlendFactor_Src => R::Src,
+        W::WGPUBlendFactor_OneMinusSrc => R::OneMinusSrc,
+        W::WGPUBlendFactor_SrcAlpha => R::SrcAlpha,
+        W::WGPUBlendFactor_OneMinusSrcAlpha => R::OneMinusSrcAlpha,
+        W::WGPUBlendFactor_Dst => R::Dst,
+        W::WGPUBlendFactor_OneMinusDst => R::OneMinusDst,
+        W::WGPUBlendFactor_DstAlpha => R::DstAlpha,
+        W::WGPUBlendFactor_OneMinusDstAlpha => R::OneMinusDstAlpha,
+        W::WGPUBlendFactor_SrcAlphaSaturated => R::SrcAlphaSaturated,
+        W::WGPUBlendFactor_Constant => R::Constant,
+        W::WGPUBlendFactor_OneMinusConstant => R::OneMinusConstant,
+        W::WGPUBlendFactor_Src1 => R::Src1,
+        W::WGPUBlendFactor_OneMinusSrc1 => R::OneMinusSrc1,
+        W::WGPUBlendFactor_Src1Alpha => R::Src1Alpha,
+        W::WGPUBlendFactor_OneMinusSrc1Alpha => R::OneMinusSrc1Alpha,
+        _ => R::One,
+    }
+}
+
+fn convert_stencil_op(o: sb::WGPUStencilOperation) -> wgpu::StencilOperation {
+    use sb::WGPUStencilOperation as W;
+    use wgpu::StencilOperation as R;
+    match o {
+        W::WGPUStencilOperation_Zero => R::Zero,
+        W::WGPUStencilOperation_Replace => R::Replace,
+        W::WGPUStencilOperation_Invert => R::Invert,
+        W::WGPUStencilOperation_IncrementClamp => R::IncrementClamp,
+        W::WGPUStencilOperation_DecrementClamp => R::DecrementClamp,
+        W::WGPUStencilOperation_IncrementWrap => R::IncrementWrap,
+        W::WGPUStencilOperation_DecrementWrap => R::DecrementWrap,
+        _ => R::Keep,
+    }
+}
+
+fn convert_optional_bool(b: sb::WGPUOptionalBool) -> Option<bool> {
+    match b {
+        sb::WGPUOptionalBool::WGPUOptionalBool_True => Some(true),
+        sb::WGPUOptionalBool::WGPUOptionalBool_False => Some(false),
+        _ => None,
+    }
+}
+
+fn convert_stencil_face(s: &sb::WGPUStencilFaceState) -> wgpu::StencilFaceState {
+    wgpu::StencilFaceState {
+        compare: convert_compare_function(s.compare).unwrap_or(wgpu::CompareFunction::Always),
+        fail_op: convert_stencil_op(s.failOp),
+        depth_fail_op: convert_stencil_op(s.depthFailOp),
+        pass_op: convert_stencil_op(s.passOp),
+    }
+}
+
+unsafe fn build_render_pipeline_descriptor<'a>(
+    desc: &'a sb::WGPURenderPipelineDescriptor,
+    label_str: &'a str,
+    vertex_buffers: &'a [wgpu::VertexBufferLayout<'a>],
+    color_targets: &'a [Option<wgpu::ColorTargetState>],
+    fragment_entry: &'a str,
+    vertex_entry: &'a str,
+) -> wgpu::RenderPipelineDescriptor<'a> {
+    let layout = if desc.layout.is_null() {
+        None
+    } else {
+        Some(&Resource::<PipelineLayoutData>::inner(desc.layout as _).inner)
+    };
+    let vertex_module = &Resource::<ShaderModuleData>::inner(desc.vertex.module as _).inner;
+    let fragment_module = if desc.fragment.is_null() {
+        None
+    } else {
+        let f = &*desc.fragment;
+        Some(&Resource::<ShaderModuleData>::inner(f.module as _).inner)
+    };
+
+    let depth_stencil = if desc.depthStencil.is_null() {
+        None
+    } else {
+        let d = &*desc.depthStencil;
+        Some(wgpu::DepthStencilState {
+            format: convert_texture_format(d.format),
+            depth_write_enabled: convert_optional_bool(d.depthWriteEnabled),
+            depth_compare: convert_compare_function(d.depthCompare),
+            stencil: wgpu::StencilState {
+                front: convert_stencil_face(&d.stencilFront),
+                back: convert_stencil_face(&d.stencilBack),
+                read_mask: d.stencilReadMask,
+                write_mask: d.stencilWriteMask,
+            },
+            bias: wgpu::DepthBiasState {
+                constant: d.depthBias,
+                slope_scale: d.depthBiasSlopeScale,
+                clamp: d.depthBiasClamp,
+            },
+        })
+    };
+
+    wgpu::RenderPipelineDescriptor {
+        label: if label_str.is_empty() { None } else { Some(label_str) },
+        layout,
+        vertex: wgpu::VertexState {
+            module: vertex_module,
+            entry_point: if vertex_entry.is_empty() {
+                None
+            } else {
+                Some(vertex_entry)
+            },
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: vertex_buffers,
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: convert_primitive_topology(desc.primitive.topology),
+            strip_index_format: convert_index_format(desc.primitive.stripIndexFormat),
+            front_face: convert_front_face(desc.primitive.frontFace),
+            cull_mode: convert_cull_mode(desc.primitive.cullMode),
+            unclipped_depth: desc.primitive.unclippedDepth != 0,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil,
+        multisample: wgpu::MultisampleState {
+            count: desc.multisample.count.max(1),
+            mask: desc.multisample.mask as u64,
+            alpha_to_coverage_enabled: desc.multisample.alphaToCoverageEnabled != 0,
+        },
+        fragment: fragment_module.map(|module| wgpu::FragmentState {
+            module,
+            entry_point: if fragment_entry.is_empty() {
+                None
+            } else {
+                Some(fragment_entry)
+            },
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: color_targets,
+        }),
+        cache: None,
+        multiview_mask: None,
+    }
+}
+
+unsafe fn create_render_pipeline_impl(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPURenderPipelineDescriptor,
+) -> sb::WGPURenderPipeline {
+    if descriptor.is_null() {
+        return ptr::null_mut();
+    }
+    let device_data = Resource::<DeviceData>::inner(device as _);
+    let desc = &*descriptor;
+    let label_str = string_view_as_str(desc.label);
+    let vertex_entry = string_view_as_str(desc.vertex.entryPoint);
+
+    // Build owned vectors of attributes / buffer layouts so they live during
+    // the create call.
+    let buffer_slice = if desc.vertex.bufferCount == 0 || desc.vertex.buffers.is_null() {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(desc.vertex.buffers, desc.vertex.bufferCount)
+    };
+
+    // Compute the largest shader_location actually used by Skia so our
+    // dummy attribute (added below for empty layouts) doesn't collide with
+    // a real one. wgpu's `max_vertex_attributes` limit is 16 on most
+    // adapters and 8 on the WebGPU minimum — using `u32::MAX` is invalid,
+    // so we pick a small number above what Skia uses.
+    let mut max_real_location: u32 = 0;
+    for b in buffer_slice {
+        if b.attributeCount == 0 || b.attributes.is_null() {
+            continue;
+        }
+        for a in std::slice::from_raw_parts(b.attributes, b.attributeCount) {
+            if a.shaderLocation >= max_real_location {
+                max_real_location = a.shaderLocation + 1;
+            }
+        }
+    }
+
+    let mut attribute_storage: Vec<Vec<wgpu::VertexAttribute>> =
+        Vec::with_capacity(buffer_slice.len());
+    let mut placeholder_slots = Vec::new();
+    for (slot, b) in buffer_slice.iter().enumerate() {
+        let attrs: Vec<wgpu::VertexAttribute> =
+            if b.attributeCount == 0 || b.attributes.is_null() {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(b.attributes, b.attributeCount)
+                    .iter()
+                    .map(|a| wgpu::VertexAttribute {
+                        format: convert_vertex_format(a.format),
+                        offset: a.offset,
+                        shader_location: a.shaderLocation,
+                    })
+                    .collect()
+            };
+        let is_placeholder = matches!(
+            b.stepMode,
+            sb::WGPUVertexStepMode::WGPUVertexStepMode_Undefined
+        ) || (b.arrayStride == 0 && attrs.is_empty());
+        if is_placeholder {
+            placeholder_slots.push(slot as u32);
+            // wgpu-core's create_render_pipeline drops VertexBufferLayouts
+            // with no attributes. That renumbers every later binding and
+            // makes Skia's set_vertex_buffer(slot=N) miss the pipeline's
+            // binding N. Insert one dummy attribute so wgpu keeps the
+            // slot. The dummy attribute reads from a u32 at offset 0; we
+            // bind our zero-filled `dummy_vertex_buffer` to this slot, so
+            // the data is a valid (but never read) zero.
+            let mut attrs = attrs;
+            attrs.push(wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Uint32,
+                offset: 0,
+                shader_location: max_real_location,
+            });
+            max_real_location += 1;
+            attribute_storage.push(attrs);
+        } else {
+            attribute_storage.push(attrs);
+        }
+    }
+    let vertex_buffers: Vec<wgpu::VertexBufferLayout> = buffer_slice
+        .iter()
+        .zip(attribute_storage.iter())
+        .map(|(b, attrs)| {
+            // For placeholder layouts give wgpu a non-zero stride so the
+            // dummy attribute (Uint32 = 4 bytes) actually fits.
+            let stride = if b.arrayStride == 0 && !attrs.is_empty() {
+                4
+            } else {
+                b.arrayStride
+            };
+            wgpu::VertexBufferLayout {
+                array_stride: stride,
+                step_mode: convert_step_mode(b.stepMode),
+                attributes: attrs.as_slice(),
+            }
+        })
+        .collect();
+
+
+    let (fragment_entry, color_targets) = if desc.fragment.is_null() {
+        (String::new(), Vec::new())
+    } else {
+        let f = &*desc.fragment;
+        let entry = string_view_as_str(f.entryPoint).to_string();
+        let targets_slice = if f.targetCount == 0 || f.targets.is_null() {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(f.targets, f.targetCount)
+        };
+        let targets: Vec<Option<wgpu::ColorTargetState>> = targets_slice
+            .iter()
+            .map(|t| {
+                if t.format == sb::WGPUTextureFormat::WGPUTextureFormat_Undefined {
+                    None
+                } else {
+                    let blend = if t.blend.is_null() {
+                        None
+                    } else {
+                        let b = &*t.blend;
+                        Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: convert_blend_factor(b.color.srcFactor),
+                                dst_factor: convert_blend_factor(b.color.dstFactor),
+                                operation: convert_blend_operation(b.color.operation),
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: convert_blend_factor(b.alpha.srcFactor),
+                                dst_factor: convert_blend_factor(b.alpha.dstFactor),
+                                operation: convert_blend_operation(b.alpha.operation),
+                            },
+                        })
+                    };
+                    Some(wgpu::ColorTargetState {
+                        format: convert_texture_format(t.format),
+                        blend,
+                        write_mask: wgpu::ColorWrites::from_bits_truncate(t.writeMask as u32),
+                    })
+                }
+            })
+            .collect();
+        (entry, targets)
+    };
+
+    let wgpu_desc = build_render_pipeline_descriptor(
+        desc,
+        label_str,
+        &vertex_buffers,
+        &color_targets,
+        fragment_entry.as_str(),
+        vertex_entry,
+    );
+    let pipeline = device_data.inner.create_render_pipeline(&wgpu_desc);
+    Resource::into_handle(RenderPipelineData {
+        inner: pipeline,
+        placeholder_slots,
+        device_handle: device,
+        _device: device_data.inner.clone(),
+    }) as sb::WGPURenderPipeline
+}
+
+unsafe extern "C" fn device_create_render_pipeline(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPURenderPipelineDescriptor,
+) -> sb::WGPURenderPipeline {
+    create_render_pipeline_impl(device, descriptor)
+}
+
+unsafe extern "C" fn device_create_render_pipeline_async(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPURenderPipelineDescriptor,
+    callback_info: sb::WGPUCreateRenderPipelineAsyncCallbackInfo,
+) -> sb::WGPUFuture {
+    let pipeline = create_render_pipeline_impl(device, descriptor);
+    let (status, msg) = if pipeline.is_null() {
+        (
+            sb::WGPUCreatePipelineAsyncStatus::WGPUCreatePipelineAsyncStatus_ValidationError,
+            "create_render_pipeline returned null",
+        )
+    } else {
+        (
+            sb::WGPUCreatePipelineAsyncStatus::WGPUCreatePipelineAsyncStatus_Success,
+            "",
+        )
+    };
+    if let Some(callback) = callback_info.callback {
+        let message_view = sb::WGPUStringView {
+            data: if msg.is_empty() { ptr::null() } else { msg.as_ptr() as _ },
+            length: msg.len(),
+        };
+        callback(
+            status,
+            pipeline,
+            message_view,
+            callback_info.userdata1,
+            callback_info.userdata2,
+        );
+    }
+    sb::WGPUFuture { id: 0 }
+}
+
+unsafe extern "C" fn render_pipeline_add_ref(handle: sb::WGPURenderPipeline) {
+    Resource::<RenderPipelineData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn render_pipeline_release(handle: sb::WGPURenderPipeline) {
+    Resource::<RenderPipelineData>::release(handle as _);
+}
+
+unsafe extern "C" fn render_pipeline_set_label(
+    _handle: sb::WGPURenderPipeline,
+    _label: sb::WGPUStringView,
+) {
+}
+
+unsafe extern "C" fn device_create_bind_group(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPUBindGroupDescriptor,
+) -> sb::WGPUBindGroup {
+    if descriptor.is_null() {
+        return ptr::null_mut();
+    }
+    let device_data = Resource::<DeviceData>::inner(device as _);
+    let desc = &*descriptor;
+    let label_str = string_view_as_str(desc.label);
+    if desc.layout.is_null() {
+        return ptr::null_mut();
+    }
+    let layout = &Resource::<BindGroupLayoutData>::inner(desc.layout as _).inner;
+
+    let entries_slice = if desc.entryCount == 0 || desc.entries.is_null() {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(desc.entries, desc.entryCount)
+    };
+
+    // Each binding has a tagged-union shape: at most one of buffer/sampler/
+    // textureView is non-null.
+    let mut rust_entries: Vec<wgpu::BindGroupEntry<'_>> = Vec::with_capacity(entries_slice.len());
+    let mut buffer_bindings_storage: Vec<wgpu::BufferBinding<'_>> = Vec::new();
+    // First pass: collect BufferBindings so we can borrow them in the entry vec.
+    for entry in entries_slice {
+        if !entry.buffer.is_null() {
+            let buf = &Resource::<BufferData>::inner(entry.buffer as _).inner;
+            // `WGPU_WHOLE_SIZE` == u64::MAX means "rest of buffer" — represent
+            // that as None in wgpu's `BufferBinding::size`.
+            let size_opt = if entry.size == 0 || entry.size == u64::MAX {
+                None
+            } else {
+                core::num::NonZeroU64::new(entry.size)
+            };
+            buffer_bindings_storage.push(wgpu::BufferBinding {
+                buffer: buf,
+                offset: entry.offset,
+                size: size_opt,
+            });
+        }
+    }
+    let mut buffer_iter = buffer_bindings_storage.iter();
+    for entry in entries_slice {
+        let resource = if !entry.buffer.is_null() {
+            wgpu::BindingResource::Buffer(buffer_iter.next().unwrap().clone())
+        } else if !entry.sampler.is_null() {
+            wgpu::BindingResource::Sampler(
+                &Resource::<SamplerData>::inner(entry.sampler as _).inner,
+            )
+        } else if !entry.textureView.is_null() {
+            wgpu::BindingResource::TextureView(
+                &Resource::<TextureViewData>::inner(entry.textureView as _).inner,
+            )
+        } else {
+            continue;
+        };
+        rust_entries.push(wgpu::BindGroupEntry {
+            binding: entry.binding,
+            resource,
+        });
+    }
+
+    let bind_group = device_data.inner.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: if label_str.is_empty() {
+            None
+        } else {
+            Some(label_str)
+        },
+        layout,
+        entries: &rust_entries,
+    });
+    Resource::into_handle(BindGroupData {
+        inner: bind_group,
+        _device: device_data.inner.clone(),
+    }) as sb::WGPUBindGroup
+}
+
+unsafe extern "C" fn bind_group_add_ref(handle: sb::WGPUBindGroup) {
+    Resource::<BindGroupData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn bind_group_release(handle: sb::WGPUBindGroup) {
+    Resource::<BindGroupData>::release(handle as _);
+}
+
+unsafe extern "C" fn bind_group_set_label(_handle: sb::WGPUBindGroup, _label: sb::WGPUStringView) {}
+
+unsafe extern "C" fn render_pipeline_get_bind_group_layout(
+    handle: sb::WGPURenderPipeline,
+    group_index: u32,
+) -> sb::WGPUBindGroupLayout {
+    let pipeline_data = Resource::<RenderPipelineData>::inner(handle as _);
+    let layout = pipeline_data.inner.get_bind_group_layout(group_index);
+    Resource::into_handle(BindGroupLayoutData {
+        inner: layout,
+        _device: pipeline_data._device.clone(),
+    }) as sb::WGPUBindGroupLayout
+}
+
+unsafe extern "C" fn shader_module_get_compilation_info(
+    _handle: sb::WGPUShaderModule,
+    callback_info: sb::WGPUCompilationInfoCallbackInfo,
+) -> sb::WGPUFuture {
+    // wgpu reports shader compile errors via the result of `create_shader_module`
+    // (or its async completion), so by the time Skia asks for compilation info
+    // we've already accepted the shader. Report Success with no messages.
+    if let Some(callback) = callback_info.callback {
+        let info = sb::WGPUCompilationInfo {
+            nextInChain: ptr::null_mut(),
+            messageCount: 0,
+            messages: ptr::null(),
+        };
+        callback(
+            sb::WGPUCompilationInfoRequestStatus::WGPUCompilationInfoRequestStatus_Success,
+            &info,
+            callback_info.userdata1,
+            callback_info.userdata2,
+        );
+    }
+    sb::WGPUFuture { id: 0 }
 }
 
 //
@@ -1854,6 +2466,109 @@ unsafe extern "C" fn render_pass_encoder_draw(
     });
 }
 
+unsafe extern "C" fn render_pass_encoder_set_pipeline(
+    handle: sb::WGPURenderPassEncoder,
+    pipeline: sb::WGPURenderPipeline,
+) {
+    if pipeline.is_null() {
+        return;
+    }
+    let pipeline_data = Resource::<RenderPipelineData>::inner(pipeline as _);
+    let pipeline_inner: *const wgpu::RenderPipeline = &pipeline_data.inner;
+    let placeholder_slots = pipeline_data.placeholder_slots.clone();
+    let device_handle = pipeline_data.device_handle;
+
+    with_render_pass(handle, |pass| {
+        // SAFETY: the pipeline Resource is refcount-held by the caller, so the
+        // wgpu::RenderPipeline reference outlives this set_pipeline call.
+        pass.set_pipeline(&*pipeline_inner);
+
+        // Auto-bind the device's dummy vertex buffer to any slots Skia
+        // declared as placeholders. wgpu's validator demands a binding even
+        // for slots whose stepMode is Undefined / VertexBufferNotUsed.
+        if !placeholder_slots.is_empty() && !device_handle.is_null() {
+            let device_data = Resource::<DeviceData>::inner(device_handle as _);
+            let dummy = device_data.dummy_vertex_buffer.get_or_init(|| {
+                device_data.inner.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("wgpu_backend dummy vertex placeholder"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            });
+            for slot in placeholder_slots {
+                pass.set_vertex_buffer(slot, dummy.slice(..));
+            }
+        }
+    });
+}
+
+unsafe extern "C" fn render_pass_encoder_set_bind_group(
+    handle: sb::WGPURenderPassEncoder,
+    group_index: u32,
+    bind_group: sb::WGPUBindGroup,
+    offset_count: usize,
+    offsets: *const u32,
+) {
+    let bind_group_ptr: Option<*const wgpu::BindGroup> = if bind_group.is_null() {
+        None
+    } else {
+        Some(&Resource::<BindGroupData>::inner(bind_group as _).inner)
+    };
+    let offsets_slice = if offset_count == 0 || offsets.is_null() {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(offsets, offset_count)
+    };
+    with_render_pass(handle, |pass| match bind_group_ptr {
+        Some(p) => pass.set_bind_group(group_index, &*p, offsets_slice),
+        None => pass.set_bind_group(group_index, None, offsets_slice),
+    });
+}
+
+unsafe extern "C" fn render_pass_encoder_set_vertex_buffer(
+    handle: sb::WGPURenderPassEncoder,
+    slot: u32,
+    buffer: sb::WGPUBuffer,
+    offset: u64,
+    size: u64,
+) {
+    if buffer.is_null() {
+        return;
+    }
+    let buffer_ptr: *const wgpu::Buffer = &Resource::<BufferData>::inner(buffer as _).inner;
+    let end = if size == u64::MAX {
+        (&*buffer_ptr).size()
+    } else {
+        offset + size
+    };
+    with_render_pass(handle, |pass| {
+        pass.set_vertex_buffer(slot, (&*buffer_ptr).slice(offset..end));
+    });
+}
+
+unsafe extern "C" fn render_pass_encoder_set_index_buffer(
+    handle: sb::WGPURenderPassEncoder,
+    buffer: sb::WGPUBuffer,
+    format: sb::WGPUIndexFormat,
+    offset: u64,
+    size: u64,
+) {
+    if buffer.is_null() {
+        return;
+    }
+    let buffer_ptr: *const wgpu::Buffer = &Resource::<BufferData>::inner(buffer as _).inner;
+    let end = if size == u64::MAX {
+        (&*buffer_ptr).size()
+    } else {
+        offset + size
+    };
+    let index_format = convert_index_format(format).unwrap_or(wgpu::IndexFormat::Uint32);
+    with_render_pass(handle, |pass| {
+        pass.set_index_buffer((&*buffer_ptr).slice(offset..end), index_format);
+    });
+}
+
 unsafe extern "C" fn render_pass_encoder_draw_indexed(
     handle: sb::WGPURenderPassEncoder,
     index_count: u32,
@@ -2021,10 +2736,18 @@ pub fn wgpu_proc_table() -> DawnProcTable {
     table.queueAddRef = Some(queue_add_ref);
     table.queueRelease = Some(queue_release);
 
+    table.deviceCreateRenderPipeline = Some(device_create_render_pipeline);
+    table.deviceCreateRenderPipelineAsync = Some(device_create_render_pipeline_async);
+    table.renderPipelineAddRef = Some(render_pipeline_add_ref);
+    table.renderPipelineRelease = Some(render_pipeline_release);
+    table.renderPipelineSetLabel = Some(render_pipeline_set_label);
+    table.renderPipelineGetBindGroupLayout = Some(render_pipeline_get_bind_group_layout);
+
     table.deviceCreateShaderModule = Some(device_create_shader_module);
     table.shaderModuleAddRef = Some(shader_module_add_ref);
     table.shaderModuleRelease = Some(shader_module_release);
     table.shaderModuleSetLabel = Some(shader_module_set_label);
+    table.shaderModuleGetCompilationInfo = Some(shader_module_get_compilation_info);
 
     table.deviceGetAdapter = Some(device_get_adapter);
     table.adapterGetInstance = Some(adapter_get_instance);
@@ -2120,6 +2843,15 @@ pub fn wgpu_proc_table() -> DawnProcTable {
     table.renderPassEncoderSetStencilReference = Some(render_pass_encoder_set_stencil_reference);
     table.renderPassEncoderDraw = Some(render_pass_encoder_draw);
     table.renderPassEncoderDrawIndexed = Some(render_pass_encoder_draw_indexed);
+    table.renderPassEncoderSetPipeline = Some(render_pass_encoder_set_pipeline);
+    table.renderPassEncoderSetBindGroup = Some(render_pass_encoder_set_bind_group);
+    table.renderPassEncoderSetVertexBuffer = Some(render_pass_encoder_set_vertex_buffer);
+    table.renderPassEncoderSetIndexBuffer = Some(render_pass_encoder_set_index_buffer);
+
+    table.deviceCreateBindGroup = Some(device_create_bind_group);
+    table.bindGroupAddRef = Some(bind_group_add_ref);
+    table.bindGroupRelease = Some(bind_group_release);
+    table.bindGroupSetLabel = Some(bind_group_set_label);
 
     table.deviceCreatePipelineLayout = Some(device_create_pipeline_layout);
     table.pipelineLayoutAddRef = Some(pipeline_layout_add_ref);

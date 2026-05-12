@@ -16,7 +16,7 @@ use skia_safe::{
         dawn::{install_proc_table, DawnDevice},
         wgpu_backend::wgpu_proc_table,
     },
-    AlphaType, Color, ColorType, IRect, ImageInfo,
+    AlphaType, Color, ColorType, IRect, ImageInfo, Paint, Rect,
 };
 
 #[test]
@@ -89,4 +89,53 @@ fn end_to_end_draw_red_via_wgpu() {
     let ok = ctx.read_pixels(&surface, &info, &mut pixels, 32 * 4, IRect::new(0, 0, 32, 32));
     assert!(ok, "read_pixels through wgpu");
     assert_eq!(&pixels[0..4], &[255, 0, 0, 255], "pixel(0,0) should be red");
+}
+
+/// Like `end_to_end_draw_red_via_wgpu` but also draws a green rectangle —
+/// exercises the full render-pipeline/bind-group/draw path.
+#[test]
+fn draw_geometry_via_wgpu() {
+    static PROCS: std::sync::OnceLock<skia_bindings::DawnProcTable> = std::sync::OnceLock::new();
+    let procs = PROCS.get_or_init(wgpu_proc_table);
+    unsafe { install_proc_table(procs) };
+
+    let Some(dawn) = DawnDevice::new() else {
+        eprintln!("Skipping: no wgpu-compatible GPU available");
+        return;
+    };
+
+    let backend = dawn.backend_context();
+    let mut ctx = unsafe {
+        graphite::Context::new_dawn(&backend, &graphite::ContextOptions::default())
+    }
+    .expect("Context::new_dawn");
+    let mut recorder = ctx
+        .make_recorder(&graphite::RecorderOptions::default())
+        .expect("make_recorder");
+
+    let info = ImageInfo::new((64, 64), ColorType::RGBA8888, AlphaType::Premul, None);
+    let mut surface = graphite::surfaces::render_target(&mut recorder, &info, None, None)
+        .expect("render_target");
+
+    let canvas = surface.canvas();
+    canvas.clear(Color::BLACK);
+    let mut paint = Paint::default();
+    paint.set_anti_alias(true);
+    paint.set_color(Color::GREEN);
+    canvas.draw_rect(Rect::new(16.0, 16.0, 48.0, 48.0), &paint);
+
+    let mut recording = recorder.snap().expect("snap");
+    let status = ctx.insert_recording(&mut recording, Some(&mut surface));
+    assert_eq!(status, graphite::InsertStatus::Success);
+
+    let mut pixels = vec![0u8; 64 * 64 * 4];
+    let ok = ctx.read_pixels(&surface, &info, &mut pixels, 64 * 4, IRect::new(0, 0, 64, 64));
+    assert!(ok);
+    // Pixel at the center of the rectangle.
+    let center = (32 * 64 + 32) * 4;
+    assert_eq!(
+        &pixels[center..center + 4],
+        &[0, 255, 0, 255],
+        "center pixel should be green"
+    );
 }
