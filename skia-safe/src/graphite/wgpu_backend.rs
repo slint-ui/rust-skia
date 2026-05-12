@@ -42,25 +42,6 @@ pub(crate) fn unimplemented_stub(name: &'static str) -> ! {
     std::process::abort();
 }
 
-/// Generates an `unsafe extern "C" fn` stub for a given WGPU function name
-/// and signature. The stub aborts when called.
-macro_rules! stub {
-    ($name:ident ( $($arg:ident : $arg_ty:ty),* $(,)? ) -> $ret:ty) => {{
-        unsafe extern "C" fn stub( $( $arg : $arg_ty ),* ) -> $ret {
-            $( let _ = $arg; )*
-            $crate::graphite::wgpu_backend::unimplemented_stub(stringify!($name))
-        }
-        Some(stub as _)
-    }};
-    ($name:ident ( $($arg:ident : $arg_ty:ty),* $(,)? )) => {{
-        unsafe extern "C" fn stub( $( $arg : $arg_ty ),* ) {
-            $( let _ = $arg; )*
-            $crate::graphite::wgpu_backend::unimplemented_stub(stringify!($name))
-        }
-        Some(stub as _)
-    }};
-}
-
 //
 // Resource handle infrastructure.
 //
@@ -124,6 +105,40 @@ struct DeviceData {
 struct QueueData {
     inner: wgpu::Queue,
     _device: wgpu::Device,
+}
+
+struct ShaderModuleData {
+    _inner: wgpu::ShaderModule,
+    _device: wgpu::Device,
+}
+
+/// Borrows a `WGPUStringView` as a Rust `&str`. Handles WebGPU's sentinel
+/// values: `WGPU_STRLEN` (== `usize::MAX`) means "data is a C string, find
+/// the NUL terminator yourself"; the empty view (null data, zero length) and
+/// any other null-data case return `""`.
+///
+/// # Safety
+/// The caller must ensure the underlying bytes outlive the returned reference
+/// and contain valid UTF-8 (Skia/Dawn always produce UTF-8 strings here).
+unsafe fn string_view_as_str<'a>(sv: sb::WGPUStringView) -> &'a str {
+    if sv.data.is_null() {
+        return "";
+    }
+    let len = if sv.length == usize::MAX {
+        // WGPU_STRLEN sentinel — fall back to strlen.
+        let mut n = 0;
+        while *sv.data.add(n) != 0 {
+            n += 1;
+        }
+        n
+    } else {
+        sv.length
+    };
+    if len == 0 {
+        return "";
+    }
+    let slice = std::slice::from_raw_parts(sv.data as *const u8, len);
+    std::str::from_utf8_unchecked(slice)
 }
 
 //
@@ -313,20 +328,308 @@ unsafe extern "C" fn queue_release(handle: sb::WGPUQueue) {
     Resource::<QueueData>::release(handle as _);
 }
 
+unsafe extern "C" fn device_create_shader_module(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPUShaderModuleDescriptor,
+) -> sb::WGPUShaderModule {
+    let device_data = Resource::<DeviceData>::inner(device as _);
+    if descriptor.is_null() {
+        return ptr::null_mut();
+    }
+    let desc = &*descriptor;
+
+    // Walk the nextInChain looking for a WGSL source. We don't currently
+    // support SPIR-V here because wgpu's SPIR-V feature is opt-in and Skia
+    // typically generates WGSL.
+    let mut wgsl: Option<&str> = None;
+    let mut next = desc.nextInChain;
+    while !next.is_null() {
+        let chain = &*next;
+        if chain.sType == sb::WGPUSType::WGPUSType_ShaderSourceWGSL {
+            let wgsl_desc = next as *const sb::WGPUShaderSourceWGSL;
+            wgsl = Some(string_view_as_str((*wgsl_desc).code));
+            break;
+        }
+        next = chain.next;
+    }
+    let Some(wgsl) = wgsl else {
+        eprintln!(
+            "wgpu_backend: deviceCreateShaderModule received no recognised \
+             source (only WGSL is supported); aborting"
+        );
+        std::process::abort();
+    };
+
+    let label = string_view_as_str(desc.label);
+    let module = device_data.inner.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: if label.is_empty() { None } else { Some(label) },
+        source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(wgsl)),
+    });
+
+    Resource::into_handle(ShaderModuleData {
+        _inner: module,
+        _device: device_data.inner.clone(),
+    }) as sb::WGPUShaderModule
+}
+
+unsafe extern "C" fn shader_module_add_ref(handle: sb::WGPUShaderModule) {
+    Resource::<ShaderModuleData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn shader_module_release(handle: sb::WGPUShaderModule) {
+    Resource::<ShaderModuleData>::release(handle as _);
+}
+
+unsafe extern "C" fn shader_module_set_label(
+    _handle: sb::WGPUShaderModule,
+    _label: sb::WGPUStringView,
+) {
+    // Labels are diagnostic and ignored.
+}
+
+//
+// Adapter / Device introspection
+//
+
+unsafe extern "C" fn device_get_adapter(handle: sb::WGPUDevice) -> sb::WGPUAdapter {
+    let device_data = Resource::<DeviceData>::inner(handle as _);
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    Resource::into_handle(AdapterData {
+        inner: device_data._adapter.clone(),
+        instance,
+    }) as sb::WGPUAdapter
+}
+
+unsafe extern "C" fn adapter_get_instance(handle: sb::WGPUAdapter) -> sb::WGPUInstance {
+    let adapter_data = Resource::<AdapterData>::inner(handle as _);
+    Resource::into_handle(InstanceData {
+        inner: adapter_data.instance.clone(),
+    }) as sb::WGPUInstance
+}
+
+unsafe extern "C" fn adapter_get_info(
+    handle: sb::WGPUAdapter,
+    out: *mut sb::WGPUAdapterInfo,
+) -> sb::WGPUStatus {
+    if out.is_null() {
+        return sb::WGPUStatus::WGPUStatus_Error;
+    }
+    let adapter = &Resource::<AdapterData>::inner(handle as _).inner;
+    let info = adapter.get_info();
+
+    let out = &mut *out;
+    out.nextInChain = ptr::null_mut();
+    out.vendor = sb::WGPUStringView {
+        data: ptr::null(),
+        length: 0,
+    };
+    out.architecture = sb::WGPUStringView {
+        data: ptr::null(),
+        length: 0,
+    };
+    out.device = sb::WGPUStringView {
+        data: ptr::null(),
+        length: 0,
+    };
+    out.description = sb::WGPUStringView {
+        data: ptr::null(),
+        length: 0,
+    };
+    out.backendType = match info.backend {
+        wgpu::Backend::Vulkan => sb::WGPUBackendType::WGPUBackendType_Vulkan,
+        wgpu::Backend::Metal => sb::WGPUBackendType::WGPUBackendType_Metal,
+        wgpu::Backend::Dx12 => sb::WGPUBackendType::WGPUBackendType_D3D12,
+        wgpu::Backend::Gl => sb::WGPUBackendType::WGPUBackendType_OpenGL,
+        wgpu::Backend::BrowserWebGpu => sb::WGPUBackendType::WGPUBackendType_WebGPU,
+        wgpu::Backend::Noop => sb::WGPUBackendType::WGPUBackendType_Null,
+    };
+    out.adapterType = match info.device_type {
+        wgpu::DeviceType::DiscreteGpu => sb::WGPUAdapterType::WGPUAdapterType_DiscreteGPU,
+        wgpu::DeviceType::IntegratedGpu => sb::WGPUAdapterType::WGPUAdapterType_IntegratedGPU,
+        wgpu::DeviceType::Cpu => sb::WGPUAdapterType::WGPUAdapterType_CPU,
+        wgpu::DeviceType::VirtualGpu | wgpu::DeviceType::Other => {
+            sb::WGPUAdapterType::WGPUAdapterType_Unknown
+        }
+    };
+    out.vendorID = info.vendor;
+    out.deviceID = info.device;
+    out.subgroupMinSize = 0;
+    out.subgroupMaxSize = 0;
+    sb::WGPUStatus::WGPUStatus_Success
+}
+
+unsafe extern "C" fn adapter_info_free_members(_info: sb::WGPUAdapterInfo) {
+    // No-op: we hand out null/empty string views with no allocated storage.
+}
+
+fn write_limits(out: &mut sb::WGPULimits, limits: wgpu::Limits) {
+    out.nextInChain = ptr::null_mut();
+    out.maxTextureDimension1D = limits.max_texture_dimension_1d;
+    out.maxTextureDimension2D = limits.max_texture_dimension_2d;
+    out.maxTextureDimension3D = limits.max_texture_dimension_3d;
+    out.maxTextureArrayLayers = limits.max_texture_array_layers;
+    out.maxBindGroups = limits.max_bind_groups;
+    out.maxBindGroupsPlusVertexBuffers =
+        limits.max_bind_groups + limits.max_vertex_buffers;
+    out.maxBindingsPerBindGroup = limits.max_bindings_per_bind_group;
+    out.maxDynamicUniformBuffersPerPipelineLayout =
+        limits.max_dynamic_uniform_buffers_per_pipeline_layout;
+    out.maxDynamicStorageBuffersPerPipelineLayout =
+        limits.max_dynamic_storage_buffers_per_pipeline_layout;
+    out.maxSampledTexturesPerShaderStage = limits.max_sampled_textures_per_shader_stage;
+    out.maxSamplersPerShaderStage = limits.max_samplers_per_shader_stage;
+    out.maxStorageBuffersPerShaderStage = limits.max_storage_buffers_per_shader_stage;
+    out.maxStorageTexturesPerShaderStage = limits.max_storage_textures_per_shader_stage;
+    out.maxUniformBuffersPerShaderStage = limits.max_uniform_buffers_per_shader_stage;
+    out.maxUniformBufferBindingSize = limits.max_uniform_buffer_binding_size as u64;
+    out.maxStorageBufferBindingSize = limits.max_storage_buffer_binding_size as u64;
+    out.minUniformBufferOffsetAlignment = limits.min_uniform_buffer_offset_alignment;
+    out.minStorageBufferOffsetAlignment = limits.min_storage_buffer_offset_alignment;
+    out.maxVertexBuffers = limits.max_vertex_buffers;
+    out.maxBufferSize = limits.max_buffer_size;
+    out.maxVertexAttributes = limits.max_vertex_attributes;
+    out.maxVertexBufferArrayStride = limits.max_vertex_buffer_array_stride;
+    out.maxInterStageShaderVariables = limits.max_inter_stage_shader_variables;
+    out.maxColorAttachments = limits.max_color_attachments;
+    out.maxColorAttachmentBytesPerSample = limits.max_color_attachment_bytes_per_sample;
+    out.maxComputeWorkgroupStorageSize = limits.max_compute_workgroup_storage_size;
+    out.maxComputeInvocationsPerWorkgroup = limits.max_compute_invocations_per_workgroup;
+    out.maxComputeWorkgroupSizeX = limits.max_compute_workgroup_size_x;
+    out.maxComputeWorkgroupSizeY = limits.max_compute_workgroup_size_y;
+    out.maxComputeWorkgroupSizeZ = limits.max_compute_workgroup_size_z;
+    out.maxComputeWorkgroupsPerDimension = limits.max_compute_workgroups_per_dimension;
+    out.maxImmediateSize = 0;
+}
+
+unsafe extern "C" fn device_get_limits(
+    handle: sb::WGPUDevice,
+    out: *mut sb::WGPULimits,
+) -> sb::WGPUStatus {
+    if out.is_null() {
+        return sb::WGPUStatus::WGPUStatus_Error;
+    }
+    let device = &Resource::<DeviceData>::inner(handle as _).inner;
+    write_limits(&mut *out, device.limits());
+    sb::WGPUStatus::WGPUStatus_Success
+}
+
+unsafe extern "C" fn adapter_get_limits(
+    handle: sb::WGPUAdapter,
+    out: *mut sb::WGPULimits,
+) -> sb::WGPUStatus {
+    if out.is_null() {
+        return sb::WGPUStatus::WGPUStatus_Error;
+    }
+    let adapter = &Resource::<AdapterData>::inner(handle as _).inner;
+    write_limits(&mut *out, adapter.limits());
+    sb::WGPUStatus::WGPUStatus_Success
+}
+
+unsafe extern "C" fn device_has_feature(
+    _handle: sb::WGPUDevice,
+    _feature: sb::WGPUFeatureName,
+) -> sb::WGPUBool {
+    0
+}
+
+unsafe extern "C" fn adapter_has_feature(
+    _handle: sb::WGPUAdapter,
+    _feature: sb::WGPUFeatureName,
+) -> sb::WGPUBool {
+    0
+}
+
+unsafe extern "C" fn device_get_features(
+    _handle: sb::WGPUDevice,
+    out: *mut sb::WGPUSupportedFeatures,
+) {
+    if !out.is_null() {
+        let out = &mut *out;
+        out.featureCount = 0;
+        out.features = ptr::null();
+    }
+}
+
+unsafe extern "C" fn adapter_get_features(
+    _handle: sb::WGPUAdapter,
+    out: *mut sb::WGPUSupportedFeatures,
+) {
+    if !out.is_null() {
+        let out = &mut *out;
+        out.featureCount = 0;
+        out.features = ptr::null();
+    }
+}
+
+unsafe extern "C" fn supported_features_free_members(_features: sb::WGPUSupportedFeatures) {
+    // No-op: we never allocated the feature list.
+}
+
+unsafe extern "C" fn device_tick(_handle: sb::WGPUDevice) {
+    // wgpu drives polling through `Device::poll`; for now, accept ticks as no-ops.
+}
+
+unsafe extern "C" fn device_set_logging_callback(
+    _handle: sb::WGPUDevice,
+    _callback_info: sb::WGPULoggingCallbackInfo,
+) {
+    // Ignored — wgpu has its own logging story.
+}
+
+unsafe extern "C" fn device_set_label(_handle: sb::WGPUDevice, _label: sb::WGPUStringView) {}
+
+unsafe extern "C" fn adapter_get_format_capabilities(
+    _handle: sb::WGPUAdapter,
+    _format: sb::WGPUTextureFormat,
+    _capabilities: *mut sb::WGPUDawnFormatCapabilities,
+) -> sb::WGPUStatus {
+    // No supported capabilities advertised. Skia uses this to probe Dawn-specific
+    // format features; returning Error makes it fall back to defaults.
+    sb::WGPUStatus::WGPUStatus_Error
+}
+
 //
 // Proc table assembly
 //
 
+/// Installs an abort-on-call stub on each named field. Each stub aborts the
+/// process with the field name, so a missing thunk surfaces as a clean error
+/// message rather than a null-pointer crash.
+///
+/// The stub has signature `unsafe extern "C" fn() -> !` and is transmuted to
+/// the field's expected signature. This is technically calling-convention
+/// abuse — the caller pushes args we ignore — but the stub aborts before
+/// returning, so no return value is ever observed and any ABI mismatch on
+/// args is harmless in practice on the platforms wgpu/Dawn target.
+macro_rules! install_abort_stubs {
+    ($table:expr, $($field:ident),* $(,)?) => {
+        $(
+            $table.$field = Some({
+                #[allow(non_snake_case)]
+                unsafe extern "C" fn stub() -> ! {
+                    $crate::graphite::wgpu_backend::unimplemented_stub(stringify!($field))
+                }
+                // SAFETY: stub diverges before any return-value or arg-handling
+                // matters. Function-pointer types are all the same size, so the
+                // transmute itself is well-formed.
+                unsafe { core::mem::transmute::<unsafe extern "C" fn() -> !, _>(stub) }
+            });
+        )*
+    };
+}
+
 /// Builds a [`DawnProcTable`] whose entries route to wgpu.
 ///
-/// Today: instance / adapter / device / queue lifecycle. Everything else is
-/// either an abort-on-call stub or `None` (which will null-deref-crash).
+/// Every entry is populated: real thunks for what we've implemented, and
+/// named abort-on-call stubs for everything else, so that the first missing
+/// thunk surfaces a clean error message identifying which WGPU function
+/// Skia needs next.
 pub fn wgpu_proc_table() -> DawnProcTable {
-    // SAFETY: Each field of `DawnProcTable` is an `Option<unsafe extern "C" fn ...>`,
-    // which uses null-pointer-optimisation: a zeroed `Option` is `None`. The
-    // fields we explicitly populate below replace those nulls.
     let mut table: DawnProcTable = unsafe { core::mem::zeroed() };
 
+    install_all_abort_stubs(&mut table);
+
+    // Real thunks — these overwrite the corresponding abort-stubs above.
     table.createInstance = Some(create_instance);
     table.instanceAddRef = Some(instance_add_ref);
     table.instanceRelease = Some(instance_release);
@@ -345,18 +648,313 @@ pub fn wgpu_proc_table() -> DawnProcTable {
     table.queueAddRef = Some(queue_add_ref);
     table.queueRelease = Some(queue_release);
 
-    populate_remaining_stubs(&mut table);
+    table.deviceCreateShaderModule = Some(device_create_shader_module);
+    table.shaderModuleAddRef = Some(shader_module_add_ref);
+    table.shaderModuleRelease = Some(shader_module_release);
+    table.shaderModuleSetLabel = Some(shader_module_set_label);
+
+    table.deviceGetAdapter = Some(device_get_adapter);
+    table.adapterGetInstance = Some(adapter_get_instance);
+    table.adapterGetInfo = Some(adapter_get_info);
+    table.adapterInfoFreeMembers = Some(adapter_info_free_members);
+    table.deviceGetLimits = Some(device_get_limits);
+    table.adapterGetLimits = Some(adapter_get_limits);
+    table.deviceHasFeature = Some(device_has_feature);
+    table.adapterHasFeature = Some(adapter_has_feature);
+    table.deviceGetFeatures = Some(device_get_features);
+    table.adapterGetFeatures = Some(adapter_get_features);
+    table.supportedFeaturesFreeMembers = Some(supported_features_free_members);
+    table.deviceTick = Some(device_tick);
+    table.deviceSetLoggingCallback = Some(device_set_logging_callback);
+    table.deviceSetLabel = Some(device_set_label);
+    table.adapterGetFormatCapabilities = Some(adapter_get_format_capabilities);
 
     table
 }
 
-/// Replaces a handful of fields with abort-on-call stubs so that the first
-/// unimplemented call surfaces a useful diagnostic instead of a null-deref
-/// crash. Functions we know Skia exercises after device creation go here as
-/// they're discovered.
-fn populate_remaining_stubs(table: &mut DawnProcTable) {
-    // Once `Context::new_wgpu` runs, Skia's Graphite-Dawn initialisation
-    // will start calling the rest of the WGPU surface; entries discovered
-    // there get listed here so the abort message identifies them by name.
-    let _ = table;
+/// Generated by enumerating every field of `DawnProcTable`. Keep this in
+/// sync with the bindgen output if the WebGPU header revision changes
+/// (bindings count: 276 fields). The list is mechanical; nothing here is
+/// load-bearing for correctness beyond `stringify!($field)` matching the
+/// dispatcher-side WGPU function name.
+fn install_all_abort_stubs(table: &mut DawnProcTable) {
+    install_abort_stubs!(
+        table,
+        createInstance,
+        getInstanceFeatures,
+        getInstanceLimits,
+        hasInstanceFeature,
+        getProcAddress,
+        adapterCreateDevice,
+        adapterGetFeatures,
+        adapterGetFormatCapabilities,
+        adapterGetInfo,
+        adapterGetInstance,
+        adapterGetLimits,
+        adapterHasFeature,
+        adapterRequestDevice,
+        adapterAddRef,
+        adapterRelease,
+        adapterInfoFreeMembers,
+        adapterPropertiesMemoryHeapsFreeMembers,
+        adapterPropertiesSubgroupMatrixConfigsFreeMembers,
+        bindGroupSetLabel,
+        bindGroupAddRef,
+        bindGroupRelease,
+        bindGroupLayoutSetLabel,
+        bindGroupLayoutAddRef,
+        bindGroupLayoutRelease,
+        bufferCreateTexelView,
+        bufferDestroy,
+        bufferGetConstMappedRange,
+        bufferGetMappedRange,
+        bufferGetMapState,
+        bufferGetSize,
+        bufferGetUsage,
+        bufferMapAsync,
+        bufferReadMappedRange,
+        bufferSetLabel,
+        bufferUnmap,
+        bufferWriteMappedRange,
+        bufferAddRef,
+        bufferRelease,
+        commandBufferSetLabel,
+        commandBufferAddRef,
+        commandBufferRelease,
+        commandEncoderBeginComputePass,
+        commandEncoderBeginRenderPass,
+        commandEncoderClearBuffer,
+        commandEncoderCopyBufferToBuffer,
+        commandEncoderCopyBufferToTexture,
+        commandEncoderCopyTextureToBuffer,
+        commandEncoderCopyTextureToTexture,
+        commandEncoderFinish,
+        commandEncoderInjectValidationError,
+        commandEncoderInsertDebugMarker,
+        commandEncoderPopDebugGroup,
+        commandEncoderPushDebugGroup,
+        commandEncoderResolveQuerySet,
+        commandEncoderSetLabel,
+        commandEncoderWriteBuffer,
+        commandEncoderWriteTimestamp,
+        commandEncoderAddRef,
+        commandEncoderRelease,
+        computePassEncoderDispatchWorkgroups,
+        computePassEncoderDispatchWorkgroupsIndirect,
+        computePassEncoderEnd,
+        computePassEncoderInsertDebugMarker,
+        computePassEncoderPopDebugGroup,
+        computePassEncoderPushDebugGroup,
+        computePassEncoderSetBindGroup,
+        computePassEncoderSetImmediates,
+        computePassEncoderSetLabel,
+        computePassEncoderSetPipeline,
+        computePassEncoderSetResourceTable,
+        computePassEncoderWriteTimestamp,
+        computePassEncoderAddRef,
+        computePassEncoderRelease,
+        computePipelineGetBindGroupLayout,
+        computePipelineSetLabel,
+        computePipelineAddRef,
+        computePipelineRelease,
+        dawnDrmFormatCapabilitiesFreeMembers,
+        deviceCreateBindGroup,
+        deviceCreateBindGroupLayout,
+        deviceCreateBuffer,
+        deviceCreateCommandEncoder,
+        deviceCreateComputePipeline,
+        deviceCreateComputePipelineAsync,
+        deviceCreateErrorBuffer,
+        deviceCreateErrorExternalTexture,
+        deviceCreateErrorShaderModule,
+        deviceCreateErrorTexture,
+        deviceCreateExternalTexture,
+        deviceCreatePipelineLayout,
+        deviceCreateQuerySet,
+        deviceCreateRenderBundleEncoder,
+        deviceCreateRenderPipeline,
+        deviceCreateRenderPipelineAsync,
+        deviceCreateResourceTable,
+        deviceCreateSampler,
+        deviceCreateShaderModule,
+        deviceCreateTexture,
+        deviceDestroy,
+        deviceForceLoss,
+        deviceGetAdapter,
+        deviceGetAdapterInfo,
+        deviceGetAHardwareBufferProperties,
+        deviceGetFeatures,
+        deviceGetLimits,
+        deviceGetLostFuture,
+        deviceGetQueue,
+        deviceHasFeature,
+        deviceImportSharedBufferMemory,
+        deviceImportSharedFence,
+        deviceImportSharedTextureMemory,
+        deviceInjectError,
+        devicePopErrorScope,
+        devicePushErrorScope,
+        deviceSetLabel,
+        deviceSetLoggingCallback,
+        deviceTick,
+        deviceValidateTextureDescriptor,
+        deviceAddRef,
+        deviceRelease,
+        externalTextureDestroy,
+        externalTextureExpire,
+        externalTextureRefresh,
+        externalTextureSetLabel,
+        externalTextureAddRef,
+        externalTextureRelease,
+        instanceCreateSurface,
+        instanceGetWGSLLanguageFeatures,
+        instanceHasWGSLLanguageFeature,
+        instanceProcessEvents,
+        instanceRequestAdapter,
+        instanceWaitAny,
+        instanceAddRef,
+        instanceRelease,
+        pipelineLayoutSetLabel,
+        pipelineLayoutAddRef,
+        pipelineLayoutRelease,
+        querySetDestroy,
+        querySetGetCount,
+        querySetGetType,
+        querySetSetLabel,
+        querySetAddRef,
+        querySetRelease,
+        queueCopyExternalTextureForBrowser,
+        queueCopyTextureForBrowser,
+        queueOnSubmittedWorkDone,
+        queueSetLabel,
+        queueSubmit,
+        queueWriteBuffer,
+        queueWriteTexture,
+        queueAddRef,
+        queueRelease,
+        renderBundleSetLabel,
+        renderBundleAddRef,
+        renderBundleRelease,
+        renderBundleEncoderDraw,
+        renderBundleEncoderDrawIndexed,
+        renderBundleEncoderDrawIndexedIndirect,
+        renderBundleEncoderDrawIndirect,
+        renderBundleEncoderFinish,
+        renderBundleEncoderInsertDebugMarker,
+        renderBundleEncoderPopDebugGroup,
+        renderBundleEncoderPushDebugGroup,
+        renderBundleEncoderSetBindGroup,
+        renderBundleEncoderSetImmediates,
+        renderBundleEncoderSetIndexBuffer,
+        renderBundleEncoderSetLabel,
+        renderBundleEncoderSetPipeline,
+        renderBundleEncoderSetResourceTable,
+        renderBundleEncoderSetVertexBuffer,
+        renderBundleEncoderAddRef,
+        renderBundleEncoderRelease,
+        renderPassEncoderBeginOcclusionQuery,
+        renderPassEncoderDraw,
+        renderPassEncoderDrawIndexed,
+        renderPassEncoderDrawIndexedIndirect,
+        renderPassEncoderDrawIndirect,
+        renderPassEncoderEnd,
+        renderPassEncoderEndOcclusionQuery,
+        renderPassEncoderExecuteBundles,
+        renderPassEncoderInsertDebugMarker,
+        renderPassEncoderMultiDrawIndexedIndirect,
+        renderPassEncoderMultiDrawIndirect,
+        renderPassEncoderPixelLocalStorageBarrier,
+        renderPassEncoderPopDebugGroup,
+        renderPassEncoderPushDebugGroup,
+        renderPassEncoderSetBindGroup,
+        renderPassEncoderSetBlendConstant,
+        renderPassEncoderSetImmediates,
+        renderPassEncoderSetIndexBuffer,
+        renderPassEncoderSetLabel,
+        renderPassEncoderSetPipeline,
+        renderPassEncoderSetResourceTable,
+        renderPassEncoderSetScissorRect,
+        renderPassEncoderSetStencilReference,
+        renderPassEncoderSetVertexBuffer,
+        renderPassEncoderSetViewport,
+        renderPassEncoderWriteTimestamp,
+        renderPassEncoderAddRef,
+        renderPassEncoderRelease,
+        renderPipelineGetBindGroupLayout,
+        renderPipelineSetLabel,
+        renderPipelineAddRef,
+        renderPipelineRelease,
+        resourceTableDestroy,
+        resourceTableGetSize,
+        resourceTableInsertBinding,
+        resourceTableRemoveBinding,
+        resourceTableUpdate,
+        resourceTableAddRef,
+        resourceTableRelease,
+        samplerSetLabel,
+        samplerAddRef,
+        samplerRelease,
+        shaderModuleGetCompilationInfo,
+        shaderModuleSetLabel,
+        shaderModuleAddRef,
+        shaderModuleRelease,
+        sharedBufferMemoryBeginAccess,
+        sharedBufferMemoryCreateBuffer,
+        sharedBufferMemoryEndAccess,
+        sharedBufferMemoryGetProperties,
+        sharedBufferMemoryIsDeviceLost,
+        sharedBufferMemorySetLabel,
+        sharedBufferMemoryAddRef,
+        sharedBufferMemoryRelease,
+        sharedBufferMemoryEndAccessStateFreeMembers,
+        sharedFenceExportInfo,
+        sharedFenceSetLabel,
+        sharedFenceAddRef,
+        sharedFenceRelease,
+        sharedTextureMemoryBeginAccess,
+        sharedTextureMemoryCreateTexture,
+        sharedTextureMemoryEndAccess,
+        sharedTextureMemoryGetProperties,
+        sharedTextureMemoryIsDeviceLost,
+        sharedTextureMemorySetLabel,
+        sharedTextureMemoryAddRef,
+        sharedTextureMemoryRelease,
+        sharedTextureMemoryEndAccessStateFreeMembers,
+        supportedFeaturesFreeMembers,
+        supportedInstanceFeaturesFreeMembers,
+        supportedWGSLLanguageFeaturesFreeMembers,
+        surfaceConfigure,
+        surfaceGetCapabilities,
+        surfaceGetCurrentTexture,
+        surfacePresent,
+        surfaceSetLabel,
+        surfaceUnconfigure,
+        surfaceAddRef,
+        surfaceRelease,
+        surfaceCapabilitiesFreeMembers,
+        texelBufferViewSetLabel,
+        texelBufferViewAddRef,
+        texelBufferViewRelease,
+        textureCreateErrorView,
+        textureCreateView,
+        textureDestroy,
+        textureGetDepthOrArrayLayers,
+        textureGetDimension,
+        textureGetFormat,
+        textureGetHeight,
+        textureGetMipLevelCount,
+        textureGetSampleCount,
+        textureGetTextureBindingViewDimension,
+        textureGetUsage,
+        textureGetWidth,
+        texturePin,
+        textureSetLabel,
+        textureSetOwnershipForMemoryDump,
+        textureUnpin,
+        textureAddRef,
+        textureRelease,
+        textureViewSetLabel,
+        textureViewAddRef,
+        textureViewRelease,
+    );
 }
