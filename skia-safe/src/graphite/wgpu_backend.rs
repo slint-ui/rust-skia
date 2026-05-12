@@ -1448,6 +1448,315 @@ unsafe extern "C" fn render_bundle_set_label(
 ) {
 }
 
+fn with_render_bundle_encoder<F>(handle: sb::WGPURenderBundleEncoder, f: F)
+where
+    F: FnOnce(&mut wgpu::RenderBundleEncoder<'static>),
+{
+    if handle.is_null() {
+        return;
+    }
+    let data = unsafe { Resource::<RenderBundleEncoderData>::inner(handle as _) };
+    if let Ok(mut guard) = data.inner.lock() {
+        if let Some(enc) = guard.as_mut() {
+            f(enc);
+        }
+    }
+}
+
+unsafe extern "C" fn render_bundle_encoder_set_pipeline(
+    handle: sb::WGPURenderBundleEncoder,
+    pipeline: sb::WGPURenderPipeline,
+) {
+    if pipeline.is_null() {
+        return;
+    }
+    let pipeline_ptr: *const wgpu::RenderPipeline =
+        &Resource::<RenderPipelineData>::inner(pipeline as _).inner;
+    with_render_bundle_encoder(handle, |enc| {
+        enc.set_pipeline(&*pipeline_ptr);
+    });
+}
+
+unsafe extern "C" fn render_bundle_encoder_set_bind_group(
+    handle: sb::WGPURenderBundleEncoder,
+    group_index: u32,
+    bind_group: sb::WGPUBindGroup,
+    offset_count: usize,
+    offsets: *const u32,
+) {
+    let bind_group_ptr: Option<*const wgpu::BindGroup> = if bind_group.is_null() {
+        None
+    } else {
+        Some(&Resource::<BindGroupData>::inner(bind_group as _).inner)
+    };
+    let offsets_slice = if offset_count == 0 || offsets.is_null() {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(offsets, offset_count)
+    };
+    with_render_bundle_encoder(handle, |enc| match bind_group_ptr {
+        Some(p) => enc.set_bind_group(group_index, &*p, offsets_slice),
+        None => enc.set_bind_group(group_index, None, offsets_slice),
+    });
+}
+
+unsafe extern "C" fn render_bundle_encoder_set_vertex_buffer(
+    handle: sb::WGPURenderBundleEncoder,
+    slot: u32,
+    buffer: sb::WGPUBuffer,
+    offset: u64,
+    size: u64,
+) {
+    if buffer.is_null() {
+        return;
+    }
+    let buf_data = Resource::<BufferData>::inner(buffer as _);
+    let len = if size == u64::MAX {
+        buf_data.inner.size().saturating_sub(offset)
+    } else {
+        size
+    };
+    let buf_ptr: *const wgpu::Buffer = &buf_data.inner;
+    with_render_bundle_encoder(handle, |enc| {
+        enc.set_vertex_buffer(slot, (*buf_ptr).slice(offset..offset + len));
+    });
+}
+
+unsafe extern "C" fn render_bundle_encoder_set_index_buffer(
+    handle: sb::WGPURenderBundleEncoder,
+    buffer: sb::WGPUBuffer,
+    format: sb::WGPUIndexFormat,
+    offset: u64,
+    size: u64,
+) {
+    if buffer.is_null() {
+        return;
+    }
+    let buf_data = Resource::<BufferData>::inner(buffer as _);
+    let len = if size == u64::MAX {
+        buf_data.inner.size().saturating_sub(offset)
+    } else {
+        size
+    };
+    let buf_ptr: *const wgpu::Buffer = &buf_data.inner;
+    let index_format = match format {
+        sb::WGPUIndexFormat::WGPUIndexFormat_Uint32 => wgpu::IndexFormat::Uint32,
+        _ => wgpu::IndexFormat::Uint16,
+    };
+    with_render_bundle_encoder(handle, |enc| {
+        enc.set_index_buffer((*buf_ptr).slice(offset..offset + len), index_format);
+    });
+}
+
+unsafe extern "C" fn render_bundle_encoder_draw(
+    handle: sb::WGPURenderBundleEncoder,
+    vertex_count: u32,
+    instance_count: u32,
+    first_vertex: u32,
+    first_instance: u32,
+) {
+    with_render_bundle_encoder(handle, |enc| {
+        enc.draw(
+            first_vertex..first_vertex + vertex_count,
+            first_instance..first_instance + instance_count,
+        );
+    });
+}
+
+unsafe extern "C" fn render_bundle_encoder_draw_indexed(
+    handle: sb::WGPURenderBundleEncoder,
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+) {
+    with_render_bundle_encoder(handle, |enc| {
+        enc.draw_indexed(
+            first_index..first_index + index_count,
+            base_vertex,
+            first_instance..first_instance + instance_count,
+        );
+    });
+}
+
+unsafe extern "C" fn render_bundle_encoder_draw_indirect(
+    handle: sb::WGPURenderBundleEncoder,
+    indirect_buffer: sb::WGPUBuffer,
+    indirect_offset: u64,
+) {
+    if indirect_buffer.is_null() {
+        return;
+    }
+    let buf_ptr: *const wgpu::Buffer =
+        &Resource::<BufferData>::inner(indirect_buffer as _).inner;
+    with_render_bundle_encoder(handle, |enc| {
+        enc.draw_indirect(&*buf_ptr, indirect_offset);
+    });
+}
+
+unsafe extern "C" fn render_bundle_encoder_draw_indexed_indirect(
+    handle: sb::WGPURenderBundleEncoder,
+    indirect_buffer: sb::WGPUBuffer,
+    indirect_offset: u64,
+) {
+    if indirect_buffer.is_null() {
+        return;
+    }
+    let buf_ptr: *const wgpu::Buffer =
+        &Resource::<BufferData>::inner(indirect_buffer as _).inner;
+    with_render_bundle_encoder(handle, |enc| {
+        enc.draw_indexed_indirect(&*buf_ptr, indirect_offset);
+    });
+}
+
+unsafe extern "C" fn render_bundle_encoder_insert_debug_marker(
+    _handle: sb::WGPURenderBundleEncoder,
+    _label: sb::WGPUStringView,
+) {
+}
+
+unsafe extern "C" fn render_bundle_encoder_push_debug_group(
+    _handle: sb::WGPURenderBundleEncoder,
+    _label: sb::WGPUStringView,
+) {
+}
+
+unsafe extern "C" fn render_bundle_encoder_pop_debug_group(
+    _handle: sb::WGPURenderBundleEncoder,
+) {
+}
+
+//
+// CommandEncoder: resolveQuerySet, writeTimestamp
+//
+
+unsafe extern "C" fn command_encoder_resolve_query_set(
+    encoder: sb::WGPUCommandEncoder,
+    query_set: sb::WGPUQuerySet,
+    first_query: u32,
+    query_count: u32,
+    destination: sb::WGPUBuffer,
+    destination_offset: u64,
+) {
+    if encoder.is_null() || query_set.is_null() || destination.is_null() {
+        return;
+    }
+    let encoder_data = Resource::<CommandEncoderData>::inner(encoder as _);
+    let qs = &Resource::<QuerySetData>::inner(query_set as _).inner;
+    let buf = &Resource::<BufferData>::inner(destination as _).inner;
+    if let Ok(mut guard) = encoder_data.inner.lock() {
+        if let Some(enc) = guard.as_mut() {
+            enc.resolve_query_set(
+                qs,
+                first_query..first_query + query_count,
+                buf,
+                destination_offset,
+            );
+        }
+    }
+}
+
+unsafe extern "C" fn command_encoder_write_timestamp(
+    encoder: sb::WGPUCommandEncoder,
+    query_set: sb::WGPUQuerySet,
+    query_index: u32,
+) {
+    if encoder.is_null() || query_set.is_null() {
+        return;
+    }
+    let encoder_data = Resource::<CommandEncoderData>::inner(encoder as _);
+    let qs = &Resource::<QuerySetData>::inner(query_set as _).inner;
+    if let Ok(mut guard) = encoder_data.inner.lock() {
+        if let Some(enc) = guard.as_mut() {
+            enc.write_timestamp(qs, query_index);
+        }
+    }
+}
+
+//
+// RenderPassEncoder: drawIndirect, drawIndexedIndirect, executeBundles,
+//                    occlusion queries, write timestamp
+//
+
+unsafe extern "C" fn render_pass_encoder_draw_indirect(
+    pass: sb::WGPURenderPassEncoder,
+    indirect_buffer: sb::WGPUBuffer,
+    indirect_offset: u64,
+) {
+    if indirect_buffer.is_null() {
+        return;
+    }
+    let buf_ptr: *const wgpu::Buffer =
+        &Resource::<BufferData>::inner(indirect_buffer as _).inner;
+    with_render_pass(pass, |p| {
+        p.draw_indirect(&*buf_ptr, indirect_offset);
+    });
+}
+
+unsafe extern "C" fn render_pass_encoder_draw_indexed_indirect(
+    pass: sb::WGPURenderPassEncoder,
+    indirect_buffer: sb::WGPUBuffer,
+    indirect_offset: u64,
+) {
+    if indirect_buffer.is_null() {
+        return;
+    }
+    let buf_ptr: *const wgpu::Buffer =
+        &Resource::<BufferData>::inner(indirect_buffer as _).inner;
+    with_render_pass(pass, |p| {
+        p.draw_indexed_indirect(&*buf_ptr, indirect_offset);
+    });
+}
+
+unsafe extern "C" fn render_pass_encoder_execute_bundles(
+    pass: sb::WGPURenderPassEncoder,
+    bundle_count: usize,
+    bundles: *const sb::WGPURenderBundle,
+) {
+    if bundle_count == 0 || bundles.is_null() {
+        return;
+    }
+    let bundles_slice = std::slice::from_raw_parts(bundles, bundle_count);
+    let bundle_refs: Vec<&wgpu::RenderBundle> = bundles_slice
+        .iter()
+        .filter(|h| !h.is_null())
+        .map(|h| &Resource::<RenderBundleData>::inner(*h as _).inner)
+        .collect();
+    with_render_pass(pass, |p| {
+        p.execute_bundles(bundle_refs.iter().copied());
+    });
+}
+
+unsafe extern "C" fn render_pass_encoder_begin_occlusion_query(
+    pass: sb::WGPURenderPassEncoder,
+    query_index: u32,
+) {
+    with_render_pass(pass, |p| {
+        p.begin_occlusion_query(query_index);
+    });
+}
+
+unsafe extern "C" fn render_pass_encoder_end_occlusion_query(pass: sb::WGPURenderPassEncoder) {
+    with_render_pass(pass, |p| {
+        p.end_occlusion_query();
+    });
+}
+
+unsafe extern "C" fn render_pass_encoder_write_timestamp(
+    pass: sb::WGPURenderPassEncoder,
+    query_set: sb::WGPUQuerySet,
+    query_index: u32,
+) {
+    if query_set.is_null() {
+        return;
+    }
+    let qs_ptr: *const wgpu::QuerySet = &Resource::<QuerySetData>::inner(query_set as _).inner;
+    with_render_pass(pass, |p| {
+        p.write_timestamp(&*qs_ptr, query_index);
+    });
+}
+
 //
 // QuerySet
 //
@@ -3445,6 +3754,29 @@ pub fn wgpu_proc_table() -> DawnProcTable {
     table.querySetGetCount = Some(query_set_get_count);
     table.querySetGetType = Some(query_set_get_type);
     table.querySetSetLabel = Some(query_set_set_label);
+
+    table.renderBundleEncoderSetPipeline = Some(render_bundle_encoder_set_pipeline);
+    table.renderBundleEncoderSetBindGroup = Some(render_bundle_encoder_set_bind_group);
+    table.renderBundleEncoderSetVertexBuffer = Some(render_bundle_encoder_set_vertex_buffer);
+    table.renderBundleEncoderSetIndexBuffer = Some(render_bundle_encoder_set_index_buffer);
+    table.renderBundleEncoderDraw = Some(render_bundle_encoder_draw);
+    table.renderBundleEncoderDrawIndexed = Some(render_bundle_encoder_draw_indexed);
+    table.renderBundleEncoderDrawIndirect = Some(render_bundle_encoder_draw_indirect);
+    table.renderBundleEncoderDrawIndexedIndirect =
+        Some(render_bundle_encoder_draw_indexed_indirect);
+    table.renderBundleEncoderInsertDebugMarker = Some(render_bundle_encoder_insert_debug_marker);
+    table.renderBundleEncoderPushDebugGroup = Some(render_bundle_encoder_push_debug_group);
+    table.renderBundleEncoderPopDebugGroup = Some(render_bundle_encoder_pop_debug_group);
+
+    table.commandEncoderResolveQuerySet = Some(command_encoder_resolve_query_set);
+    table.commandEncoderWriteTimestamp = Some(command_encoder_write_timestamp);
+
+    table.renderPassEncoderDrawIndirect = Some(render_pass_encoder_draw_indirect);
+    table.renderPassEncoderDrawIndexedIndirect = Some(render_pass_encoder_draw_indexed_indirect);
+    table.renderPassEncoderExecuteBundles = Some(render_pass_encoder_execute_bundles);
+    table.renderPassEncoderBeginOcclusionQuery = Some(render_pass_encoder_begin_occlusion_query);
+    table.renderPassEncoderEndOcclusionQuery = Some(render_pass_encoder_end_occlusion_query);
+    table.renderPassEncoderWriteTimestamp = Some(render_pass_encoder_write_timestamp);
 
     table.deviceCreatePipelineLayout = Some(device_create_pipeline_layout);
     table.pipelineLayoutAddRef = Some(pipeline_layout_add_ref);
