@@ -9,6 +9,7 @@
 //! This module currently exposes the backend-agnostic core. Backend factories
 //! (Dawn, and platform-specific helpers) will be added in a follow-up.
 
+mod backend_texture;
 mod context;
 pub mod dawn;
 mod options;
@@ -17,6 +18,7 @@ mod recording;
 pub mod surfaces;
 mod types;
 
+pub use backend_texture::BackendTexture;
 pub use context::Context;
 pub use options::{ContextOptions, RecorderOptions};
 pub use recorder::Recorder;

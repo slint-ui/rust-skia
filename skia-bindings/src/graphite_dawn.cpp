@@ -9,9 +9,11 @@
 
 #include "bindings.h"
 
+#include "include/gpu/graphite/BackendTexture.h"
 #include "include/gpu/graphite/Context.h"
 #include "include/gpu/graphite/ContextOptions.h"
 #include "include/gpu/graphite/dawn/DawnBackendContext.h"
+#include "include/gpu/graphite/dawn/DawnGraphiteTypes.h"
 #include "dawn/dawn_proc.h"
 #include "dawn/native/DawnNative.h"
 #include "webgpu/webgpu.h"
@@ -131,4 +133,14 @@ extern "C" bool C_SkgpuGraphite_DawnDefaultSetup(
     *outDevice = device;
     *outQueue = wgpuDeviceGetQueue(device);
     return true;
+}
+
+// Wraps an existing WGPUTexture in a Graphite BackendTexture. The texture's
+// metadata (size, format, usage, ...) is queried from the WGPUTexture itself.
+// The BackendTexture does not retain/release the WGPUTexture; the caller must
+// keep it alive until any wrapping Surface/Image goes away.
+extern "C" skgpu::graphite::BackendTexture* C_SkgpuGraphite_BackendTextures_MakeDawn(
+        WGPUTexture texture) {
+    return new skgpu::graphite::BackendTexture(
+            skgpu::graphite::BackendTextures::MakeDawn(texture));
 }

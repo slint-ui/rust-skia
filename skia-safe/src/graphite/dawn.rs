@@ -2,9 +2,9 @@
 
 use std::{fmt, ptr};
 
-use skia_bindings::{self as sb, WGPUDevice, WGPUInstance, WGPUQueue};
+use skia_bindings::{self as sb, WGPUDevice, WGPUInstance, WGPUQueue, WGPUTexture};
 
-use super::{Context, ContextOptions};
+use super::{BackendTexture, Context, ContextOptions};
 use crate::prelude::*;
 
 /// Raw WebGPU handles that Graphite needs to construct a Dawn-backed
@@ -124,4 +124,19 @@ impl Drop for DawnDevice {
             sb::wgpuInstanceRelease(self.instance);
         }
     }
+}
+
+/// Wraps an existing `WGPUTexture` (e.g. a swapchain image obtained from
+/// `wgpuSurfaceGetCurrentTexture`) as a Graphite [`BackendTexture`]. The
+/// resulting BackendTexture queries its metadata (size, format, ...) from the
+/// underlying texture.
+///
+/// # Safety
+///
+/// `texture` must be a live `WGPUTexture` handle. The BackendTexture does
+/// **not** add a reference to it; the caller is responsible for keeping the
+/// texture alive for as long as the BackendTexture (and any wrapping Surface
+/// or Image) is used.
+pub unsafe fn backend_texture_from_wgpu_texture(texture: WGPUTexture) -> Option<BackendTexture> {
+    BackendTexture::from_ptr(sb::C_SkgpuGraphite_BackendTextures_MakeDawn(texture))
 }

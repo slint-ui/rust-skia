@@ -13,12 +13,14 @@
 #include "include/core/SkSurface.h"
 #include "include/core/SkSurfaceProps.h"
 #include "include/gpu/GpuTypes.h"
+#include "include/gpu/graphite/BackendTexture.h"
 #include "include/gpu/graphite/Context.h"
 #include "include/gpu/graphite/ContextOptions.h"
 #include "include/gpu/graphite/GraphiteTypes.h"
 #include "include/gpu/graphite/Recorder.h"
 #include "include/gpu/graphite/Recording.h"
 #include "include/gpu/graphite/Surface.h"
+#include "include/core/SkColorSpace.h"
 
 #include <cstring>
 #include <memory>
@@ -199,6 +201,44 @@ extern "C" SkSurface* C_SkgpuGraphite_Surfaces_RenderTarget(
     sk_sp<SkSurface> surface = SkSurfaces::RenderTarget(
             recorder, *imageInfo, mipmapped, surfaceProps);
     return surface.release();
+}
+
+// Wraps an existing Graphite BackendTexture in a Surface. The caller is
+// responsible for keeping the underlying GPU texture alive for as long as the
+// Surface is used.
+extern "C" SkSurface* C_SkgpuGraphite_Surfaces_WrapBackendTexture(
+        skgr::Recorder* recorder,
+        const skgr::BackendTexture* backendTexture,
+        SkColorSpace* colorSpace,
+        const SkSurfaceProps* surfaceProps) {
+    sk_sp<SkSurface> surface = SkSurfaces::WrapBackendTexture(
+            recorder, *backendTexture, sk_ref_sp(colorSpace), surfaceProps);
+    return surface.release();
+}
+
+//
+// skgpu::graphite::BackendTexture
+//
+
+extern "C" void C_SkgpuGraphite_BackendTexture_delete(skgr::BackendTexture* bt) {
+    delete bt;
+}
+
+extern "C" bool C_SkgpuGraphite_BackendTexture_isValid(const skgr::BackendTexture* bt) {
+    return bt->isValid();
+}
+
+extern "C" skgpu::BackendApi C_SkgpuGraphite_BackendTexture_backend(
+        const skgr::BackendTexture* bt) {
+    return bt->backend();
+}
+
+extern "C" int C_SkgpuGraphite_BackendTexture_width(const skgr::BackendTexture* bt) {
+    return bt->dimensions().fWidth;
+}
+
+extern "C" int C_SkgpuGraphite_BackendTexture_height(const skgr::BackendTexture* bt) {
+    return bt->dimensions().fHeight;
 }
 
 //
