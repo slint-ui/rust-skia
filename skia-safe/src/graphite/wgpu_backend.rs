@@ -131,6 +131,14 @@ struct SamplerData {
 struct BufferData {
     inner: wgpu::Buffer,
     _device: wgpu::Device,
+    /// Mapped views kept alive between get_mapped_range and unmap. wgpu
+    /// records the mapped sub-range in `BufferViewMut`'s drop impl; if we
+    /// drop the view immediately after extracting the raw pointer, wgpu
+    /// stops considering that range as "mapped" and writes the caller
+    /// performs through the raw pointer may not be flushed to the GPU on
+    /// unmap. Storing the view here keeps the range tracked.
+    active_views_mut: std::sync::Mutex<Vec<wgpu::BufferViewMut>>,
+    active_views_const: std::sync::Mutex<Vec<wgpu::BufferView>>,
 }
 
 struct PipelineLayoutData {
@@ -1570,6 +1578,8 @@ unsafe extern "C" fn device_create_buffer(
     Resource::into_handle(BufferData {
         inner: buffer,
         _device: device_data.inner.clone(),
+        active_views_mut: std::sync::Mutex::new(Vec::new()),
+        active_views_const: std::sync::Mutex::new(Vec::new()),
     }) as sb::WGPUBuffer
 }
 
@@ -1613,15 +1623,15 @@ unsafe extern "C" fn buffer_get_mapped_range(
     offset: usize,
     size: usize,
 ) -> *mut core::ffi::c_void {
-    let buffer = &Resource::<BufferData>::inner(handle as _).inner;
-    let (start, end) = buffer_slice_range(buffer, offset, size);
-    let mut view = buffer.slice(start..end).get_mapped_range_mut();
-    // The pointer to the mapped memory remains valid until the buffer is
-    // unmapped — wgpu tracks the view's *bookkeeping* via its Drop impl, but
-    // not the pointer itself. We let the view drop normally so unmap()
-    // doesn't trip on "view still active"; the C-side pointer is fine to
-    // use until Skia calls bufferUnmap.
-    view.slice(..).as_raw_element_ptr().as_ptr() as *mut core::ffi::c_void
+    let buffer_data = Resource::<BufferData>::inner(handle as _);
+    let (start, end) = buffer_slice_range(&buffer_data.inner, offset, size);
+    let mut view = buffer_data.inner.slice(start..end).get_mapped_range_mut();
+    let ptr = view.slice(..).as_raw_element_ptr().as_ptr() as *mut core::ffi::c_void;
+    // Keep the view alive until unmap — see BufferData docstring for why.
+    if let Ok(mut active) = buffer_data.active_views_mut.lock() {
+        active.push(view);
+    }
+    ptr
 }
 
 unsafe extern "C" fn buffer_get_const_mapped_range(
@@ -1629,17 +1639,31 @@ unsafe extern "C" fn buffer_get_const_mapped_range(
     offset: usize,
     size: usize,
 ) -> *const core::ffi::c_void {
-    let buffer = &Resource::<BufferData>::inner(handle as _).inner;
-    let (start, end) = buffer_slice_range(buffer, offset, size);
-    let view = buffer.slice(start..end).get_mapped_range();
-    (*view).as_ptr() as *const core::ffi::c_void
+    let buffer_data = Resource::<BufferData>::inner(handle as _);
+    let (start, end) = buffer_slice_range(&buffer_data.inner, offset, size);
+    let view = buffer_data.inner.slice(start..end).get_mapped_range();
+    let ptr = (*view).as_ptr() as *const core::ffi::c_void;
+    if let Ok(mut active) = buffer_data.active_views_const.lock() {
+        active.push(view);
+    }
+    ptr
 }
 
 unsafe extern "C" fn buffer_unmap(handle: sb::WGPUBuffer) {
     if handle.is_null() {
         return;
     }
-    Resource::<BufferData>::inner(handle as _).inner.unmap();
+    let buffer_data = Resource::<BufferData>::inner(handle as _);
+    // Drop any active views first so wgpu's map_context tracking is clean
+    // before we call unmap (which would otherwise reject "views still
+    // accessible").
+    if let Ok(mut active) = buffer_data.active_views_mut.lock() {
+        active.clear();
+    }
+    if let Ok(mut active) = buffer_data.active_views_const.lock() {
+        active.clear();
+    }
+    buffer_data.inner.unmap();
 }
 
 unsafe extern "C" fn buffer_get_map_state(_handle: sb::WGPUBuffer) -> sb::WGPUBufferMapState {
