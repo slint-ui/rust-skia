@@ -17,6 +17,8 @@ mod recorder;
 mod recording;
 pub mod surfaces;
 mod types;
+#[cfg(feature = "wgpu")]
+pub mod wgpu_backend;
 
 pub use backend_texture::BackendTexture;
 pub use context::Context;

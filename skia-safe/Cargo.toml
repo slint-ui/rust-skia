@@ -39,6 +39,10 @@ vulkan = ["gpu", "skia-bindings/vulkan"]
 metal = ["gpu", "skia-bindings/metal"]
 d3d = ["gpu", "windows", "skia-bindings/d3d"]
 graphite = ["skia-bindings/graphite"]
+# Routes Graphite's WebGPU calls into the `wgpu` Rust crate instead of Dawn.
+# Experimental and incomplete: only a small subset of the WebGPU C ABI is
+# implemented; the rest will panic-abort on first call.
+wgpu = ["graphite", "dep:wgpu"]
 textlayout = ["skia-bindings/textlayout"]
 svg = ["skia-bindings/svg", "dep:base64", "dep:percent-encoding", "skia-svg-macros"]
 skottie = ["skia-bindings/skottie", "textlayout", "dep:base64", "dep:percent-encoding"]
@@ -63,6 +67,7 @@ gpu = []
 [dependencies]
 bitflags = "2.0"
 skia-bindings = { version = "=0.97.0", path = "../skia-bindings", default-features = false }
+wgpu = { version = "29", optional = true, default-features = false }
 
 
 # D3D types & ComPtr
