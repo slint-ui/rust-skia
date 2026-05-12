@@ -188,6 +188,32 @@ struct BindGroupData {
     _device: wgpu::Device,
 }
 
+struct ComputePipelineData {
+    inner: wgpu::ComputePipeline,
+    _device: wgpu::Device,
+}
+
+struct ComputePassEncoderData {
+    inner: std::sync::Mutex<Option<wgpu::ComputePass<'static>>>,
+}
+
+struct RenderBundleData {
+    inner: wgpu::RenderBundle,
+    _device: wgpu::Device,
+}
+
+struct RenderBundleEncoderData {
+    inner: std::sync::Mutex<Option<wgpu::RenderBundleEncoder<'static>>>,
+    _device: wgpu::Device,
+}
+
+struct QuerySetData {
+    inner: wgpu::QuerySet,
+    count: u32,
+    ty: sb::WGPUQueryType,
+    _device: wgpu::Device,
+}
+
 /// A live render pass. wgpu's `RenderPass` borrows from its parent
 /// `CommandEncoder`, but we extend the lifetime to `'static` via
 /// `forget_lifetime` so the C-side handle is independent of any Rust lock
@@ -1024,6 +1050,454 @@ unsafe extern "C" fn bind_group_release(handle: sb::WGPUBindGroup) {
 }
 
 unsafe extern "C" fn bind_group_set_label(_handle: sb::WGPUBindGroup, _label: sb::WGPUStringView) {}
+
+//
+// ComputePipeline
+//
+
+unsafe extern "C" fn device_create_compute_pipeline(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPUComputePipelineDescriptor,
+) -> sb::WGPUComputePipeline {
+    if descriptor.is_null() {
+        return ptr::null_mut();
+    }
+    let device_data = Resource::<DeviceData>::inner(device as _);
+    let desc = &*descriptor;
+    let label_str = string_view_as_str(desc.label);
+    let entry_str = string_view_as_str(desc.compute.entryPoint);
+
+    let module = &Resource::<ShaderModuleData>::inner(desc.compute.module as _).inner;
+    let layout = if desc.layout.is_null() {
+        None
+    } else {
+        Some(&Resource::<PipelineLayoutData>::inner(desc.layout as _).inner)
+    };
+
+    let pipeline = device_data
+        .inner
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: if label_str.is_empty() { None } else { Some(label_str) },
+            layout,
+            module,
+            entry_point: if entry_str.is_empty() { None } else { Some(entry_str) },
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+    Resource::into_handle(ComputePipelineData {
+        inner: pipeline,
+        _device: device_data.inner.clone(),
+    }) as sb::WGPUComputePipeline
+}
+
+unsafe extern "C" fn device_create_compute_pipeline_async(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPUComputePipelineDescriptor,
+    callback_info: sb::WGPUCreateComputePipelineAsyncCallbackInfo,
+) -> sb::WGPUFuture {
+    let pipeline = device_create_compute_pipeline(device, descriptor);
+    if let Some(callback) = callback_info.callback {
+        let status = if pipeline.is_null() {
+            sb::WGPUCreatePipelineAsyncStatus::WGPUCreatePipelineAsyncStatus_ValidationError
+        } else {
+            sb::WGPUCreatePipelineAsyncStatus::WGPUCreatePipelineAsyncStatus_Success
+        };
+        let message = sb::WGPUStringView {
+            data: ptr::null(),
+            length: 0,
+        };
+        callback(
+            status,
+            pipeline,
+            message,
+            callback_info.userdata1,
+            callback_info.userdata2,
+        );
+    }
+    sb::WGPUFuture { id: 0 }
+}
+
+unsafe extern "C" fn compute_pipeline_add_ref(handle: sb::WGPUComputePipeline) {
+    Resource::<ComputePipelineData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn compute_pipeline_release(handle: sb::WGPUComputePipeline) {
+    Resource::<ComputePipelineData>::release(handle as _);
+}
+
+unsafe extern "C" fn compute_pipeline_set_label(
+    _handle: sb::WGPUComputePipeline,
+    _label: sb::WGPUStringView,
+) {
+}
+
+unsafe extern "C" fn compute_pipeline_get_bind_group_layout(
+    handle: sb::WGPUComputePipeline,
+    group_index: u32,
+) -> sb::WGPUBindGroupLayout {
+    let pipeline_data = Resource::<ComputePipelineData>::inner(handle as _);
+    let layout = pipeline_data.inner.get_bind_group_layout(group_index);
+    Resource::into_handle(BindGroupLayoutData {
+        inner: layout,
+        _device: pipeline_data._device.clone(),
+    }) as sb::WGPUBindGroupLayout
+}
+
+//
+// ComputePassEncoder
+//
+
+unsafe extern "C" fn command_encoder_begin_compute_pass(
+    encoder: sb::WGPUCommandEncoder,
+    descriptor: *const sb::WGPUComputePassDescriptor,
+) -> sb::WGPUComputePassEncoder {
+    let encoder_data = Resource::<CommandEncoderData>::inner(encoder as _);
+    let label_str = if descriptor.is_null() {
+        ""
+    } else {
+        string_view_as_str((*descriptor).label)
+    };
+    let pass_static = {
+        let mut guard = encoder_data.inner.lock().expect("encoder mutex poisoned");
+        let Some(enc) = guard.as_mut() else {
+            return ptr::null_mut();
+        };
+        let pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: if label_str.is_empty() { None } else { Some(label_str) },
+            timestamp_writes: None,
+        });
+        pass.forget_lifetime()
+    };
+    Resource::into_handle(ComputePassEncoderData {
+        inner: std::sync::Mutex::new(Some(pass_static)),
+    }) as sb::WGPUComputePassEncoder
+}
+
+unsafe extern "C" fn compute_pass_encoder_add_ref(handle: sb::WGPUComputePassEncoder) {
+    Resource::<ComputePassEncoderData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn compute_pass_encoder_release(handle: sb::WGPUComputePassEncoder) {
+    Resource::<ComputePassEncoderData>::release(handle as _);
+}
+
+unsafe extern "C" fn compute_pass_encoder_set_label(
+    _handle: sb::WGPUComputePassEncoder,
+    _label: sb::WGPUStringView,
+) {
+}
+
+fn with_compute_pass<F>(handle: sb::WGPUComputePassEncoder, f: F)
+where
+    F: FnOnce(&mut wgpu::ComputePass<'static>),
+{
+    if handle.is_null() {
+        return;
+    }
+    let data = unsafe { Resource::<ComputePassEncoderData>::inner(handle as _) };
+    if let Ok(mut guard) = data.inner.lock() {
+        if let Some(pass) = guard.as_mut() {
+            f(pass);
+        }
+    }
+}
+
+unsafe extern "C" fn compute_pass_encoder_end(handle: sb::WGPUComputePassEncoder) {
+    if handle.is_null() {
+        return;
+    }
+    let data = Resource::<ComputePassEncoderData>::inner(handle as _);
+    if let Ok(mut guard) = data.inner.lock() {
+        // Dropping the ComputePass encodes the End command into the parent
+        // CommandEncoder.
+        let _ = guard.take();
+    }
+}
+
+unsafe extern "C" fn compute_pass_encoder_set_pipeline(
+    handle: sb::WGPUComputePassEncoder,
+    pipeline: sb::WGPUComputePipeline,
+) {
+    if pipeline.is_null() {
+        return;
+    }
+    let pipeline_inner: *const wgpu::ComputePipeline =
+        &Resource::<ComputePipelineData>::inner(pipeline as _).inner;
+    with_compute_pass(handle, |pass| {
+        pass.set_pipeline(&*pipeline_inner);
+    });
+}
+
+unsafe extern "C" fn compute_pass_encoder_set_bind_group(
+    handle: sb::WGPUComputePassEncoder,
+    group_index: u32,
+    bind_group: sb::WGPUBindGroup,
+    offset_count: usize,
+    offsets: *const u32,
+) {
+    let bind_group_ptr: Option<*const wgpu::BindGroup> = if bind_group.is_null() {
+        None
+    } else {
+        Some(&Resource::<BindGroupData>::inner(bind_group as _).inner)
+    };
+    let offsets_slice = if offset_count == 0 || offsets.is_null() {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(offsets, offset_count)
+    };
+    with_compute_pass(handle, |pass| match bind_group_ptr {
+        Some(p) => pass.set_bind_group(group_index, &*p, offsets_slice),
+        None => pass.set_bind_group(group_index, None, offsets_slice),
+    });
+}
+
+unsafe extern "C" fn compute_pass_encoder_dispatch_workgroups(
+    handle: sb::WGPUComputePassEncoder,
+    x: u32,
+    y: u32,
+    z: u32,
+) {
+    with_compute_pass(handle, |pass| {
+        pass.dispatch_workgroups(x, y, z);
+    });
+}
+
+unsafe extern "C" fn compute_pass_encoder_dispatch_workgroups_indirect(
+    handle: sb::WGPUComputePassEncoder,
+    indirect_buffer: sb::WGPUBuffer,
+    indirect_offset: u64,
+) {
+    if indirect_buffer.is_null() {
+        return;
+    }
+    let buf_ptr: *const wgpu::Buffer =
+        &Resource::<BufferData>::inner(indirect_buffer as _).inner;
+    with_compute_pass(handle, |pass| {
+        pass.dispatch_workgroups_indirect(&*buf_ptr, indirect_offset);
+    });
+}
+
+unsafe extern "C" fn compute_pass_encoder_insert_debug_marker(
+    _handle: sb::WGPUComputePassEncoder,
+    _label: sb::WGPUStringView,
+) {
+}
+
+unsafe extern "C" fn compute_pass_encoder_push_debug_group(
+    _handle: sb::WGPUComputePassEncoder,
+    _label: sb::WGPUStringView,
+) {
+}
+
+unsafe extern "C" fn compute_pass_encoder_pop_debug_group(_handle: sb::WGPUComputePassEncoder) {}
+
+//
+// queueWriteTexture
+//
+
+unsafe extern "C" fn queue_write_texture(
+    queue: sb::WGPUQueue,
+    destination: *const sb::WGPUTexelCopyTextureInfo,
+    data: *const core::ffi::c_void,
+    data_size: usize,
+    data_layout: *const sb::WGPUTexelCopyBufferLayout,
+    write_size: *const sb::WGPUExtent3D,
+) {
+    if destination.is_null() || data.is_null() || data_layout.is_null() || write_size.is_null() {
+        return;
+    }
+    let queue_data = Resource::<QueueData>::inner(queue as _);
+    let dst = convert_texel_copy_texture(&*destination);
+    let layout = &*data_layout;
+    let size = *write_size;
+    let slice = std::slice::from_raw_parts(data as *const u8, data_size);
+    queue_data.inner.write_texture(
+        dst,
+        slice,
+        wgpu::TexelCopyBufferLayout {
+            offset: layout.offset,
+            bytes_per_row: if layout.bytesPerRow == u32::MAX {
+                None
+            } else {
+                Some(layout.bytesPerRow)
+            },
+            rows_per_image: if layout.rowsPerImage == u32::MAX {
+                None
+            } else {
+                Some(layout.rowsPerImage)
+            },
+        },
+        wgpu::Extent3d {
+            width: size.width,
+            height: size.height,
+            depth_or_array_layers: size.depthOrArrayLayers,
+        },
+    );
+}
+
+//
+// RenderBundle
+//
+
+unsafe extern "C" fn device_create_render_bundle_encoder(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPURenderBundleEncoderDescriptor,
+) -> sb::WGPURenderBundleEncoder {
+    if descriptor.is_null() {
+        return ptr::null_mut();
+    }
+    let device_data = Resource::<DeviceData>::inner(device as _);
+    let desc = &*descriptor;
+    let label_str = string_view_as_str(desc.label);
+
+    let color_formats: Vec<Option<wgpu::TextureFormat>> = if desc.colorFormatCount == 0
+        || desc.colorFormats.is_null()
+    {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(desc.colorFormats, desc.colorFormatCount)
+            .iter()
+            .map(|f| {
+                if *f == sb::WGPUTextureFormat::WGPUTextureFormat_Undefined {
+                    None
+                } else {
+                    Some(convert_texture_format(*f))
+                }
+            })
+            .collect()
+    };
+    let depth_stencil = if desc.depthStencilFormat
+        == sb::WGPUTextureFormat::WGPUTextureFormat_Undefined
+    {
+        None
+    } else {
+        Some(wgpu::RenderBundleDepthStencil {
+            format: convert_texture_format(desc.depthStencilFormat),
+            depth_read_only: desc.depthReadOnly != 0,
+            stencil_read_only: desc.stencilReadOnly != 0,
+        })
+    };
+
+    let encoder = device_data
+        .inner
+        .create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
+            label: if label_str.is_empty() { None } else { Some(label_str) },
+            color_formats: &color_formats,
+            depth_stencil,
+            sample_count: desc.sampleCount.max(1),
+            multiview: None,
+        });
+    Resource::into_handle(RenderBundleEncoderData {
+        inner: std::sync::Mutex::new(Some(encoder)),
+        _device: device_data.inner.clone(),
+    }) as sb::WGPURenderBundleEncoder
+}
+
+unsafe extern "C" fn render_bundle_encoder_add_ref(handle: sb::WGPURenderBundleEncoder) {
+    Resource::<RenderBundleEncoderData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn render_bundle_encoder_release(handle: sb::WGPURenderBundleEncoder) {
+    Resource::<RenderBundleEncoderData>::release(handle as _);
+}
+
+unsafe extern "C" fn render_bundle_encoder_set_label(
+    _handle: sb::WGPURenderBundleEncoder,
+    _label: sb::WGPUStringView,
+) {
+}
+
+unsafe extern "C" fn render_bundle_encoder_finish(
+    handle: sb::WGPURenderBundleEncoder,
+    descriptor: *const sb::WGPURenderBundleDescriptor,
+) -> sb::WGPURenderBundle {
+    let encoder_data = Resource::<RenderBundleEncoderData>::inner(handle as _);
+    let Some(encoder) = encoder_data.inner.lock().ok().and_then(|mut g| g.take()) else {
+        return ptr::null_mut();
+    };
+    let label_str = if descriptor.is_null() {
+        String::new()
+    } else {
+        string_view_as_str((*descriptor).label).to_string()
+    };
+    let bundle = encoder.finish(&wgpu::RenderBundleDescriptor {
+        label: if label_str.is_empty() {
+            None
+        } else {
+            Some(label_str.as_str())
+        },
+    });
+    Resource::into_handle(RenderBundleData {
+        inner: bundle,
+        _device: encoder_data._device.clone(),
+    }) as sb::WGPURenderBundle
+}
+
+unsafe extern "C" fn render_bundle_add_ref(handle: sb::WGPURenderBundle) {
+    Resource::<RenderBundleData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn render_bundle_release(handle: sb::WGPURenderBundle) {
+    Resource::<RenderBundleData>::release(handle as _);
+}
+
+unsafe extern "C" fn render_bundle_set_label(
+    _handle: sb::WGPURenderBundle,
+    _label: sb::WGPUStringView,
+) {
+}
+
+//
+// QuerySet
+//
+
+unsafe extern "C" fn device_create_query_set(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPUQuerySetDescriptor,
+) -> sb::WGPUQuerySet {
+    if descriptor.is_null() {
+        return ptr::null_mut();
+    }
+    let device_data = Resource::<DeviceData>::inner(device as _);
+    let desc = &*descriptor;
+    let label_str = string_view_as_str(desc.label);
+    let ty = match desc.type_ {
+        sb::WGPUQueryType::WGPUQueryType_Timestamp => wgpu::QueryType::Timestamp,
+        _ => wgpu::QueryType::Occlusion,
+    };
+    let query_set = device_data.inner.create_query_set(&wgpu::QuerySetDescriptor {
+        label: if label_str.is_empty() { None } else { Some(label_str) },
+        ty,
+        count: desc.count,
+    });
+    Resource::into_handle(QuerySetData {
+        inner: query_set,
+        count: desc.count,
+        ty: desc.type_,
+        _device: device_data.inner.clone(),
+    }) as sb::WGPUQuerySet
+}
+
+unsafe extern "C" fn query_set_add_ref(handle: sb::WGPUQuerySet) {
+    Resource::<QuerySetData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn query_set_release(handle: sb::WGPUQuerySet) {
+    Resource::<QuerySetData>::release(handle as _);
+}
+
+unsafe extern "C" fn query_set_destroy(_handle: sb::WGPUQuerySet) {}
+
+unsafe extern "C" fn query_set_get_count(handle: sb::WGPUQuerySet) -> u32 {
+    Resource::<QuerySetData>::inner(handle as _).count
+}
+
+unsafe extern "C" fn query_set_get_type(handle: sb::WGPUQuerySet) -> sb::WGPUQueryType {
+    Resource::<QuerySetData>::inner(handle as _).ty
+}
+
+unsafe extern "C" fn query_set_set_label(_handle: sb::WGPUQuerySet, _label: sb::WGPUStringView) {}
 
 unsafe extern "C" fn render_pipeline_get_bind_group_layout(
     handle: sb::WGPURenderPipeline,
@@ -2931,6 +3405,46 @@ pub fn wgpu_proc_table() -> DawnProcTable {
     table.bindGroupAddRef = Some(bind_group_add_ref);
     table.bindGroupRelease = Some(bind_group_release);
     table.bindGroupSetLabel = Some(bind_group_set_label);
+
+    table.deviceCreateComputePipeline = Some(device_create_compute_pipeline);
+    table.deviceCreateComputePipelineAsync = Some(device_create_compute_pipeline_async);
+    table.computePipelineAddRef = Some(compute_pipeline_add_ref);
+    table.computePipelineRelease = Some(compute_pipeline_release);
+    table.computePipelineSetLabel = Some(compute_pipeline_set_label);
+    table.computePipelineGetBindGroupLayout = Some(compute_pipeline_get_bind_group_layout);
+
+    table.commandEncoderBeginComputePass = Some(command_encoder_begin_compute_pass);
+    table.computePassEncoderAddRef = Some(compute_pass_encoder_add_ref);
+    table.computePassEncoderRelease = Some(compute_pass_encoder_release);
+    table.computePassEncoderSetLabel = Some(compute_pass_encoder_set_label);
+    table.computePassEncoderEnd = Some(compute_pass_encoder_end);
+    table.computePassEncoderSetPipeline = Some(compute_pass_encoder_set_pipeline);
+    table.computePassEncoderSetBindGroup = Some(compute_pass_encoder_set_bind_group);
+    table.computePassEncoderDispatchWorkgroups = Some(compute_pass_encoder_dispatch_workgroups);
+    table.computePassEncoderDispatchWorkgroupsIndirect =
+        Some(compute_pass_encoder_dispatch_workgroups_indirect);
+    table.computePassEncoderInsertDebugMarker = Some(compute_pass_encoder_insert_debug_marker);
+    table.computePassEncoderPushDebugGroup = Some(compute_pass_encoder_push_debug_group);
+    table.computePassEncoderPopDebugGroup = Some(compute_pass_encoder_pop_debug_group);
+
+    table.queueWriteTexture = Some(queue_write_texture);
+
+    table.deviceCreateRenderBundleEncoder = Some(device_create_render_bundle_encoder);
+    table.renderBundleEncoderAddRef = Some(render_bundle_encoder_add_ref);
+    table.renderBundleEncoderRelease = Some(render_bundle_encoder_release);
+    table.renderBundleEncoderSetLabel = Some(render_bundle_encoder_set_label);
+    table.renderBundleEncoderFinish = Some(render_bundle_encoder_finish);
+    table.renderBundleAddRef = Some(render_bundle_add_ref);
+    table.renderBundleRelease = Some(render_bundle_release);
+    table.renderBundleSetLabel = Some(render_bundle_set_label);
+
+    table.deviceCreateQuerySet = Some(device_create_query_set);
+    table.querySetAddRef = Some(query_set_add_ref);
+    table.querySetRelease = Some(query_set_release);
+    table.querySetDestroy = Some(query_set_destroy);
+    table.querySetGetCount = Some(query_set_get_count);
+    table.querySetGetType = Some(query_set_get_type);
+    table.querySetSetLabel = Some(query_set_set_label);
 
     table.deviceCreatePipelineLayout = Some(device_create_pipeline_layout);
     table.pipelineLayoutAddRef = Some(pipeline_layout_add_ref);
