@@ -156,6 +156,15 @@ struct TextureViewData {
     _texture: wgpu::Texture,
 }
 
+/// A live render pass. wgpu's `RenderPass` borrows from its parent
+/// `CommandEncoder`, but we extend the lifetime to `'static` via
+/// `forget_lifetime` so the C-side handle is independent of any Rust lock
+/// guard. Callers must respect the WGPU contract that the encoder isn't
+/// reused while a pass is active and that End is called before drop.
+struct RenderPassEncoderData {
+    inner: std::sync::Mutex<Option<wgpu::RenderPass<'static>>>,
+}
+
 /// Borrows a `WGPUStringView` as a Rust `&str`. Handles WebGPU's sentinel
 /// values: `WGPU_STRLEN` (== `usize::MAX`) means "data is a C string, find
 /// the NUL terminator yourself"; the empty view (null data, zero length) and
@@ -1234,6 +1243,127 @@ unsafe extern "C" fn command_encoder_copy_buffer_to_buffer(
     });
 }
 
+fn convert_texture_aspect(a: sb::WGPUTextureAspect) -> wgpu::TextureAspect {
+    match a {
+        sb::WGPUTextureAspect::WGPUTextureAspect_StencilOnly => wgpu::TextureAspect::StencilOnly,
+        sb::WGPUTextureAspect::WGPUTextureAspect_DepthOnly => wgpu::TextureAspect::DepthOnly,
+        _ => wgpu::TextureAspect::All,
+    }
+}
+
+unsafe fn convert_texel_copy_texture(
+    info: &sb::WGPUTexelCopyTextureInfo,
+) -> wgpu::TexelCopyTextureInfo<'_> {
+    let texture = &Resource::<TextureData>::inner(info.texture as _).inner;
+    wgpu::TexelCopyTextureInfo {
+        texture,
+        mip_level: info.mipLevel,
+        origin: wgpu::Origin3d {
+            x: info.origin.x,
+            y: info.origin.y,
+            z: info.origin.z,
+        },
+        aspect: convert_texture_aspect(info.aspect),
+    }
+}
+
+unsafe fn convert_texel_copy_buffer(
+    info: &sb::WGPUTexelCopyBufferInfo,
+) -> wgpu::TexelCopyBufferInfo<'_> {
+    let buffer = &Resource::<BufferData>::inner(info.buffer as _).inner;
+    wgpu::TexelCopyBufferInfo {
+        buffer,
+        layout: wgpu::TexelCopyBufferLayout {
+            offset: info.layout.offset,
+            bytes_per_row: if info.layout.bytesPerRow == u32::MAX {
+                None
+            } else {
+                Some(info.layout.bytesPerRow)
+            },
+            rows_per_image: if info.layout.rowsPerImage == u32::MAX {
+                None
+            } else {
+                Some(info.layout.rowsPerImage)
+            },
+        },
+    }
+}
+
+unsafe extern "C" fn command_encoder_copy_texture_to_buffer(
+    encoder: sb::WGPUCommandEncoder,
+    source: *const sb::WGPUTexelCopyTextureInfo,
+    destination: *const sb::WGPUTexelCopyBufferInfo,
+    copy_size: *const sb::WGPUExtent3D,
+) {
+    if source.is_null() || destination.is_null() || copy_size.is_null() {
+        return;
+    }
+    let src = convert_texel_copy_texture(&*source);
+    let dst = convert_texel_copy_buffer(&*destination);
+    let size = *copy_size;
+    with_encoder(encoder, |enc| {
+        enc.copy_texture_to_buffer(
+            src,
+            dst,
+            wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: size.depthOrArrayLayers,
+            },
+        );
+    });
+}
+
+unsafe extern "C" fn command_encoder_copy_buffer_to_texture(
+    encoder: sb::WGPUCommandEncoder,
+    source: *const sb::WGPUTexelCopyBufferInfo,
+    destination: *const sb::WGPUTexelCopyTextureInfo,
+    copy_size: *const sb::WGPUExtent3D,
+) {
+    if source.is_null() || destination.is_null() || copy_size.is_null() {
+        return;
+    }
+    let src = convert_texel_copy_buffer(&*source);
+    let dst = convert_texel_copy_texture(&*destination);
+    let size = *copy_size;
+    with_encoder(encoder, |enc| {
+        enc.copy_buffer_to_texture(
+            src,
+            dst,
+            wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: size.depthOrArrayLayers,
+            },
+        );
+    });
+}
+
+unsafe extern "C" fn command_encoder_copy_texture_to_texture(
+    encoder: sb::WGPUCommandEncoder,
+    source: *const sb::WGPUTexelCopyTextureInfo,
+    destination: *const sb::WGPUTexelCopyTextureInfo,
+    copy_size: *const sb::WGPUExtent3D,
+) {
+    if source.is_null() || destination.is_null() || copy_size.is_null() {
+        return;
+    }
+    let src = convert_texel_copy_texture(&*source);
+    let dst = convert_texel_copy_texture(&*destination);
+    let size = *copy_size;
+    with_encoder(encoder, |enc| {
+        enc.copy_texture_to_texture(
+            src,
+            dst,
+            wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: size.depthOrArrayLayers,
+            },
+        );
+    });
+}
+
 unsafe extern "C" fn command_encoder_clear_buffer(
     encoder: sb::WGPUCommandEncoder,
     buffer: sb::WGPUBuffer,
@@ -1461,6 +1591,286 @@ unsafe extern "C" fn texture_view_set_label(
 ) {
 }
 
+//
+// RenderPass
+//
+
+fn convert_load_op(op: sb::WGPULoadOp, clear: sb::WGPUColor) -> wgpu::LoadOp<wgpu::Color> {
+    match op {
+        sb::WGPULoadOp::WGPULoadOp_Load => wgpu::LoadOp::Load,
+        // Clear and any unrecognised op fall through to Clear with the
+        // caller-supplied value.
+        _ => wgpu::LoadOp::Clear(wgpu::Color {
+            r: clear.r,
+            g: clear.g,
+            b: clear.b,
+            a: clear.a,
+        }),
+    }
+}
+
+fn convert_depth_load_op(op: sb::WGPULoadOp, clear: f32) -> wgpu::LoadOp<f32> {
+    match op {
+        sb::WGPULoadOp::WGPULoadOp_Load => wgpu::LoadOp::Load,
+        _ => wgpu::LoadOp::Clear(clear),
+    }
+}
+
+fn convert_stencil_load_op(op: sb::WGPULoadOp, clear: u32) -> wgpu::LoadOp<u32> {
+    match op {
+        sb::WGPULoadOp::WGPULoadOp_Load => wgpu::LoadOp::Load,
+        _ => wgpu::LoadOp::Clear(clear),
+    }
+}
+
+fn convert_store_op(op: sb::WGPUStoreOp) -> wgpu::StoreOp {
+    match op {
+        sb::WGPUStoreOp::WGPUStoreOp_Discard => wgpu::StoreOp::Discard,
+        _ => wgpu::StoreOp::Store,
+    }
+}
+
+unsafe extern "C" fn command_encoder_begin_render_pass(
+    encoder: sb::WGPUCommandEncoder,
+    descriptor: *const sb::WGPURenderPassDescriptor,
+) -> sb::WGPURenderPassEncoder {
+    let encoder_data = Resource::<CommandEncoderData>::inner(encoder as _);
+    if descriptor.is_null() {
+        return ptr::null_mut();
+    }
+    let desc = &*descriptor;
+    let label = string_view_as_str(desc.label);
+
+    let color_slice = if desc.colorAttachmentCount == 0 || desc.colorAttachments.is_null() {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(desc.colorAttachments, desc.colorAttachmentCount)
+    };
+    let color_attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = color_slice
+        .iter()
+        .map(|att| {
+            if att.view.is_null() {
+                None
+            } else {
+                let view = &Resource::<TextureViewData>::inner(att.view as _).inner;
+                let resolve_target = if att.resolveTarget.is_null() {
+                    None
+                } else {
+                    Some(&Resource::<TextureViewData>::inner(att.resolveTarget as _).inner)
+                };
+                Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: convert_load_op(att.loadOp, att.clearValue),
+                        store: convert_store_op(att.storeOp),
+                    },
+                })
+            }
+        })
+        .collect();
+
+    let depth_stencil_attachment = if desc.depthStencilAttachment.is_null() {
+        None
+    } else {
+        let ds = &*desc.depthStencilAttachment;
+        if ds.view.is_null() {
+            None
+        } else {
+            let view = &Resource::<TextureViewData>::inner(ds.view as _).inner;
+            let depth_ops = if ds.depthLoadOp == sb::WGPULoadOp::WGPULoadOp_Undefined
+                && ds.depthStoreOp == sb::WGPUStoreOp::WGPUStoreOp_Undefined
+            {
+                None
+            } else {
+                Some(wgpu::Operations {
+                    load: convert_depth_load_op(ds.depthLoadOp, ds.depthClearValue),
+                    store: convert_store_op(ds.depthStoreOp),
+                })
+            };
+            let stencil_ops = if ds.stencilLoadOp == sb::WGPULoadOp::WGPULoadOp_Undefined
+                && ds.stencilStoreOp == sb::WGPUStoreOp::WGPUStoreOp_Undefined
+            {
+                None
+            } else {
+                Some(wgpu::Operations {
+                    load: convert_stencil_load_op(ds.stencilLoadOp, ds.stencilClearValue),
+                    store: convert_store_op(ds.stencilStoreOp),
+                })
+            };
+            Some(wgpu::RenderPassDepthStencilAttachment {
+                view,
+                depth_ops,
+                stencil_ops,
+            })
+        }
+    };
+
+    let pass_static = {
+        let mut guard = encoder_data
+            .inner
+            .lock()
+            .expect("command encoder mutex poisoned");
+        let Some(enc) = guard.as_mut() else {
+            return ptr::null_mut();
+        };
+        let pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: if label.is_empty() { None } else { Some(label) },
+            color_attachments: &color_attachments,
+            depth_stencil_attachment,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.forget_lifetime()
+    };
+
+    Resource::into_handle(RenderPassEncoderData {
+        inner: std::sync::Mutex::new(Some(pass_static)),
+    }) as sb::WGPURenderPassEncoder
+}
+
+unsafe extern "C" fn render_pass_encoder_add_ref(handle: sb::WGPURenderPassEncoder) {
+    Resource::<RenderPassEncoderData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn render_pass_encoder_release(handle: sb::WGPURenderPassEncoder) {
+    Resource::<RenderPassEncoderData>::release(handle as _);
+}
+
+unsafe extern "C" fn render_pass_encoder_set_label(
+    _handle: sb::WGPURenderPassEncoder,
+    _label: sb::WGPUStringView,
+) {
+}
+
+unsafe extern "C" fn render_pass_encoder_end(handle: sb::WGPURenderPassEncoder) {
+    if handle.is_null() {
+        return;
+    }
+    let data = Resource::<RenderPassEncoderData>::inner(handle as _);
+    if let Ok(mut guard) = data.inner.lock() {
+        // wgpu 29 ends the pass via Drop; taking the Option drops the pass
+        // here, which encodes the End command into the parent CommandEncoder.
+        let _ = guard.take();
+    }
+}
+
+unsafe extern "C" fn render_pass_encoder_insert_debug_marker(
+    _handle: sb::WGPURenderPassEncoder,
+    _label: sb::WGPUStringView,
+) {
+}
+
+unsafe extern "C" fn render_pass_encoder_push_debug_group(
+    _handle: sb::WGPURenderPassEncoder,
+    _label: sb::WGPUStringView,
+) {
+}
+
+unsafe extern "C" fn render_pass_encoder_pop_debug_group(_handle: sb::WGPURenderPassEncoder) {}
+
+fn with_render_pass<F>(handle: sb::WGPURenderPassEncoder, f: F)
+where
+    F: FnOnce(&mut wgpu::RenderPass<'static>),
+{
+    if handle.is_null() {
+        return;
+    }
+    let data = unsafe { Resource::<RenderPassEncoderData>::inner(handle as _) };
+    if let Ok(mut guard) = data.inner.lock() {
+        if let Some(pass) = guard.as_mut() {
+            f(pass);
+        }
+    }
+}
+
+unsafe extern "C" fn render_pass_encoder_set_viewport(
+    handle: sb::WGPURenderPassEncoder,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    min_depth: f32,
+    max_depth: f32,
+) {
+    with_render_pass(handle, |pass| {
+        pass.set_viewport(x, y, width, height, min_depth, max_depth);
+    });
+}
+
+unsafe extern "C" fn render_pass_encoder_set_scissor_rect(
+    handle: sb::WGPURenderPassEncoder,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) {
+    with_render_pass(handle, |pass| {
+        pass.set_scissor_rect(x, y, width, height);
+    });
+}
+
+unsafe extern "C" fn render_pass_encoder_set_blend_constant(
+    handle: sb::WGPURenderPassEncoder,
+    color: *const sb::WGPUColor,
+) {
+    if color.is_null() {
+        return;
+    }
+    let c = *color;
+    with_render_pass(handle, |pass| {
+        pass.set_blend_constant(wgpu::Color {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+            a: c.a,
+        });
+    });
+}
+
+unsafe extern "C" fn render_pass_encoder_set_stencil_reference(
+    handle: sb::WGPURenderPassEncoder,
+    reference: u32,
+) {
+    with_render_pass(handle, |pass| {
+        pass.set_stencil_reference(reference);
+    });
+}
+
+unsafe extern "C" fn render_pass_encoder_draw(
+    handle: sb::WGPURenderPassEncoder,
+    vertex_count: u32,
+    instance_count: u32,
+    first_vertex: u32,
+    first_instance: u32,
+) {
+    with_render_pass(handle, |pass| {
+        pass.draw(
+            first_vertex..first_vertex + vertex_count,
+            first_instance..first_instance + instance_count,
+        );
+    });
+}
+
+unsafe extern "C" fn render_pass_encoder_draw_indexed(
+    handle: sb::WGPURenderPassEncoder,
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+) {
+    with_render_pass(handle, |pass| {
+        pass.draw_indexed(
+            first_index..first_index + index_count,
+            base_vertex,
+            first_instance..first_instance + instance_count,
+        );
+    });
+}
+
 unsafe extern "C" fn queue_on_submitted_work_done(
     queue: sb::WGPUQueue,
     callback_info: sb::WGPUQueueWorkDoneCallbackInfo,
@@ -1668,6 +2078,9 @@ pub fn wgpu_proc_table() -> DawnProcTable {
     table.commandEncoderPopDebugGroup = Some(command_encoder_pop_debug_group);
     table.commandEncoderCopyBufferToBuffer = Some(command_encoder_copy_buffer_to_buffer);
     table.commandEncoderClearBuffer = Some(command_encoder_clear_buffer);
+    table.commandEncoderCopyTextureToBuffer = Some(command_encoder_copy_texture_to_buffer);
+    table.commandEncoderCopyBufferToTexture = Some(command_encoder_copy_buffer_to_texture);
+    table.commandEncoderCopyTextureToTexture = Some(command_encoder_copy_texture_to_texture);
 
     table.commandBufferAddRef = Some(command_buffer_add_ref);
     table.commandBufferRelease = Some(command_buffer_release);
@@ -1692,6 +2105,21 @@ pub fn wgpu_proc_table() -> DawnProcTable {
     table.textureViewAddRef = Some(texture_view_add_ref);
     table.textureViewRelease = Some(texture_view_release);
     table.textureViewSetLabel = Some(texture_view_set_label);
+
+    table.commandEncoderBeginRenderPass = Some(command_encoder_begin_render_pass);
+    table.renderPassEncoderAddRef = Some(render_pass_encoder_add_ref);
+    table.renderPassEncoderRelease = Some(render_pass_encoder_release);
+    table.renderPassEncoderSetLabel = Some(render_pass_encoder_set_label);
+    table.renderPassEncoderEnd = Some(render_pass_encoder_end);
+    table.renderPassEncoderInsertDebugMarker = Some(render_pass_encoder_insert_debug_marker);
+    table.renderPassEncoderPushDebugGroup = Some(render_pass_encoder_push_debug_group);
+    table.renderPassEncoderPopDebugGroup = Some(render_pass_encoder_pop_debug_group);
+    table.renderPassEncoderSetViewport = Some(render_pass_encoder_set_viewport);
+    table.renderPassEncoderSetScissorRect = Some(render_pass_encoder_set_scissor_rect);
+    table.renderPassEncoderSetBlendConstant = Some(render_pass_encoder_set_blend_constant);
+    table.renderPassEncoderSetStencilReference = Some(render_pass_encoder_set_stencil_reference);
+    table.renderPassEncoderDraw = Some(render_pass_encoder_draw);
+    table.renderPassEncoderDrawIndexed = Some(render_pass_encoder_draw_indexed);
 
     table.deviceCreatePipelineLayout = Some(device_create_pipeline_layout);
     table.pipelineLayoutAddRef = Some(pipeline_layout_add_ref);

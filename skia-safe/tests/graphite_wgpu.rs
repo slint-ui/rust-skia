@@ -51,15 +51,11 @@ fn dawn_setup_through_wgpu_proc_table() {
     eprintln!("Context::new_dawn succeeded through wgpu: {ctx:?}");
 }
 
-/// Aspirational test: draws red onto a Graphite-backed surface entirely
-/// through the wgpu-routed proc table. Currently fails on
-/// `commandEncoderBeginRenderPass` and the render pipeline / pass chain,
-/// which haven't been thunked yet. Marked `#[ignore]` until the rest of
-/// the WebGPU surface lands; run with
-/// `cargo test ... -- --ignored end_to_end_draw_red_via_wgpu` to probe
-/// progress.
+/// Draws red onto a Graphite-backed surface entirely through the
+/// wgpu-routed proc table and verifies the pixel comes back. Closes the
+/// loop: Skia's MakeDawn / Recorder / RenderPass / async read pixels all
+/// run against the `wgpu` Rust crate via the proc-table dispatch.
 #[test]
-#[ignore]
 fn end_to_end_draw_red_via_wgpu() {
     static PROCS: std::sync::OnceLock<skia_bindings::DawnProcTable> = std::sync::OnceLock::new();
     let procs = PROCS.get_or_init(wgpu_proc_table);
