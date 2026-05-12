@@ -497,6 +497,209 @@ fn render_bundle_via_wgpu_proc_table() {
     }
 }
 
+/// Drives a render bundle through executeBundles inside a render pass.
+/// Records `set_pipeline + draw(3 verts, 1 inst)` into a bundle that
+/// targets RGBA8 + no vertex buffers; the shader produces a green triangle
+/// covering the whole framebuffer. Then executes the bundle from a real
+/// render pass on a small color attachment and verifies the pixel.
+///
+/// Exercises: deviceCreateRenderBundleEncoder, renderBundleEncoderSetPipeline,
+/// renderBundleEncoderDraw, renderBundleEncoderFinish,
+/// renderPassEncoderExecuteBundles.
+#[test]
+fn render_bundle_draw_via_wgpu_proc_table() {
+    use skia_bindings as sb;
+    static PROCS: std::sync::OnceLock<sb::DawnProcTable> = std::sync::OnceLock::new();
+    let procs = PROCS.get_or_init(wgpu_proc_table);
+    unsafe { install_proc_table(procs) };
+
+    let Some(dawn) = DawnDevice::new() else {
+        eprintln!("Skipping: no wgpu-compatible GPU available");
+        return;
+    };
+    let device = dawn.device();
+    let queue = dawn.queue();
+
+    let wgsl = "\
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n\
+  // Big triangle covering the entire viewport.\n\
+  let pos = array(vec2f(-1.0, -3.0), vec2f(-1.0, 1.0), vec2f(3.0, 1.0));\n\
+  return vec4f(pos[i], 0.0, 1.0);\n\
+}\n\
+@fragment fn fs() -> @location(0) vec4f { return vec4f(0.0, 1.0, 0.0, 1.0); }\n";
+
+    unsafe {
+        // Shader module.
+        let mut wgsl_desc: sb::WGPUShaderSourceWGSL =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        wgsl_desc.chain.sType = sb::WGPUSType::WGPUSType_ShaderSourceWGSL;
+        wgsl_desc.code = sv(wgsl);
+        let mut sm_desc: sb::WGPUShaderModuleDescriptor =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        sm_desc.nextInChain = &mut wgsl_desc.chain as *mut _;
+        sm_desc.label = sv("rb_shader");
+        let sm = (procs.deviceCreateShaderModule.unwrap())(device, &sm_desc);
+        assert!(!sm.is_null(), "shader module");
+
+        // Pipeline layout (no bind groups).
+        let mut pl_desc: sb::WGPUPipelineLayoutDescriptor =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        pl_desc.label = sv("pl");
+        pl_desc.bindGroupLayoutCount = 0;
+        pl_desc.bindGroupLayouts = std::ptr::null();
+        let pl = (procs.deviceCreatePipelineLayout.unwrap())(device, &pl_desc);
+
+        // Color target.
+        let mut color_target: sb::WGPUColorTargetState =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        color_target.format = sb::WGPUTextureFormat::WGPUTextureFormat_RGBA8Unorm;
+        color_target.writeMask = 0xF;
+
+        let mut frag: sb::WGPUFragmentState = std::mem::MaybeUninit::zeroed().assume_init();
+        frag.module = sm;
+        frag.entryPoint = sv("fs");
+        frag.targetCount = 1;
+        frag.targets = &color_target;
+
+        let mut rp_desc: sb::WGPURenderPipelineDescriptor =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        rp_desc.label = sv("rp");
+        rp_desc.layout = pl;
+        rp_desc.vertex.module = sm;
+        rp_desc.vertex.entryPoint = sv("vs");
+        rp_desc.vertex.bufferCount = 0;
+        rp_desc.vertex.buffers = std::ptr::null();
+        rp_desc.primitive.topology = sb::WGPUPrimitiveTopology::WGPUPrimitiveTopology_TriangleList;
+        rp_desc.primitive.frontFace = sb::WGPUFrontFace::WGPUFrontFace_CCW;
+        rp_desc.primitive.cullMode = sb::WGPUCullMode::WGPUCullMode_None;
+        rp_desc.multisample.count = 1;
+        rp_desc.multisample.mask = 0xFFFFFFFF;
+        rp_desc.fragment = &frag;
+        let pipeline = (procs.deviceCreateRenderPipeline.unwrap())(device, &rp_desc);
+        assert!(!pipeline.is_null(), "render pipeline");
+
+        // Create render bundle: set_pipeline + draw(3, 1, 0, 0); finish.
+        let color_format = sb::WGPUTextureFormat::WGPUTextureFormat_RGBA8Unorm;
+        let mut rbe_desc: sb::WGPURenderBundleEncoderDescriptor =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        rbe_desc.label = sv("rbe");
+        rbe_desc.colorFormatCount = 1;
+        rbe_desc.colorFormats = &color_format;
+        rbe_desc.depthStencilFormat = sb::WGPUTextureFormat::WGPUTextureFormat_Undefined;
+        rbe_desc.sampleCount = 1;
+        let rbe = (procs.deviceCreateRenderBundleEncoder.unwrap())(device, &rbe_desc);
+        (procs.renderBundleEncoderSetPipeline.unwrap())(rbe, pipeline);
+        (procs.renderBundleEncoderDraw.unwrap())(rbe, 3, 1, 0, 0);
+        let mut rb_desc: sb::WGPURenderBundleDescriptor =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        rb_desc.label = sv("rb");
+        let bundle = (procs.renderBundleEncoderFinish.unwrap())(rbe, &rb_desc);
+        assert!(!bundle.is_null(), "render bundle finish");
+        (procs.renderBundleEncoderRelease.unwrap())(rbe);
+
+        // Color attachment texture.
+        let mut tex_desc: sb::WGPUTextureDescriptor =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        tex_desc.label = sv("color");
+        tex_desc.usage = (0x10 /* RenderAttachment */) | WGPU_TEXTURE_USAGE_COPY_SRC;
+        tex_desc.dimension = sb::WGPUTextureDimension::WGPUTextureDimension_2D;
+        tex_desc.size = sb::WGPUExtent3D {
+            width: 4,
+            height: 4,
+            depthOrArrayLayers: 1,
+        };
+        tex_desc.format = sb::WGPUTextureFormat::WGPUTextureFormat_RGBA8Unorm;
+        tex_desc.mipLevelCount = 1;
+        tex_desc.sampleCount = 1;
+        let tex = (procs.deviceCreateTexture.unwrap())(device, &tex_desc);
+        let view = (procs.textureCreateView.unwrap())(tex, std::ptr::null());
+
+        // Encoder + render pass.
+        let mut enc_desc: sb::WGPUCommandEncoderDescriptor =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        enc_desc.label = sv("enc");
+        let enc = (procs.deviceCreateCommandEncoder.unwrap())(device, &enc_desc);
+
+        let mut color_att: sb::WGPURenderPassColorAttachment =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        color_att.view = view;
+        color_att.depthSlice = u32::MAX;
+        color_att.loadOp = sb::WGPULoadOp::WGPULoadOp_Clear;
+        color_att.storeOp = sb::WGPUStoreOp::WGPUStoreOp_Store;
+        color_att.clearValue = sb::WGPUColor {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+
+        let mut pass_desc: sb::WGPURenderPassDescriptor =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        pass_desc.label = sv("pass");
+        pass_desc.colorAttachmentCount = 1;
+        pass_desc.colorAttachments = &color_att;
+        let pass = (procs.commandEncoderBeginRenderPass.unwrap())(enc, &pass_desc);
+        (procs.renderPassEncoderExecuteBundles.unwrap())(pass, 1, &bundle);
+        (procs.renderPassEncoderEnd.unwrap())(pass);
+        (procs.renderPassEncoderRelease.unwrap())(pass);
+
+        // Read back.
+        let mut buf_desc: sb::WGPUBufferDescriptor =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        buf_desc.label = sv("rb_buf");
+        buf_desc.usage = WGPU_BUFFER_USAGE_MAP_READ | WGPU_BUFFER_USAGE_COPY_DST;
+        buf_desc.size = 256 * 4;
+        let rb_buf = (procs.deviceCreateBuffer.unwrap())(device, &buf_desc);
+
+        let mut src_info: sb::WGPUTexelCopyTextureInfo =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        src_info.texture = tex;
+        src_info.aspect = sb::WGPUTextureAspect::WGPUTextureAspect_All;
+        let mut dst_buf_info: sb::WGPUTexelCopyBufferInfo =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        dst_buf_info.layout.bytesPerRow = 256;
+        dst_buf_info.layout.rowsPerImage = 4;
+        dst_buf_info.buffer = rb_buf;
+        let copy_size = sb::WGPUExtent3D {
+            width: 4,
+            height: 4,
+            depthOrArrayLayers: 1,
+        };
+        (procs.commandEncoderCopyTextureToBuffer.unwrap())(
+            enc, &src_info, &dst_buf_info, &copy_size,
+        );
+
+        let mut cb_desc: sb::WGPUCommandBufferDescriptor =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        cb_desc.label = sv("cb");
+        let cb = (procs.commandEncoderFinish.unwrap())(enc, &cb_desc);
+        (procs.commandEncoderRelease.unwrap())(enc);
+        (procs.queueSubmit.unwrap())(queue, 1, &cb);
+        (procs.commandBufferRelease.unwrap())(cb);
+
+        let mapped = Box::new(std::sync::atomic::AtomicBool::new(false));
+        let mut cb_info: sb::WGPUBufferMapCallbackInfo =
+            std::mem::MaybeUninit::zeroed().assume_init();
+        cb_info.mode = sb::WGPUCallbackMode::WGPUCallbackMode_AllowProcessEvents;
+        cb_info.callback = Some(map_done);
+        cb_info.userdata1 = &*mapped as *const _ as *mut _;
+        (procs.bufferMapAsync.unwrap())(rb_buf, WGPU_MAP_MODE_READ, 0, 256 * 4, cb_info);
+        assert!(poll_for_map(procs, device, &mapped), "map");
+
+        let ptr = (procs.bufferGetConstMappedRange.unwrap())(rb_buf, 0, 256 * 4) as *const u8;
+        let first = std::slice::from_raw_parts(ptr, 4);
+        assert_eq!(first, &[0, 255, 0, 255], "bundle rendered green");
+        (procs.bufferUnmap.unwrap())(rb_buf);
+        (procs.bufferRelease.unwrap())(rb_buf);
+        (procs.textureViewRelease.unwrap())(view);
+        (procs.textureRelease.unwrap())(tex);
+        (procs.renderBundleRelease.unwrap())(bundle);
+        (procs.renderPipelineRelease.unwrap())(pipeline);
+        (procs.pipelineLayoutRelease.unwrap())(pl);
+        (procs.shaderModuleRelease.unwrap())(sm);
+    }
+}
+
 /// Like `end_to_end_draw_red_via_wgpu` but also draws a green rectangle —
 /// exercises the full render-pipeline/bind-group/draw path.
 #[test]
