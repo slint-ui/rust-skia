@@ -71,6 +71,34 @@ void device_callback(WGPURequestDeviceStatus status,
 // platform's preferred backend (Vulkan on Linux/Android, Metal on macOS/iOS,
 // D3D12 on Windows). On success the caller owns one reference of each handle
 // and must release them.
+// Single guard for any installation of the global proc table. First caller
+// wins; later attempts are no-ops. This is deliberately one flag shared
+// between the user-facing install entry points and the default-install we do
+// from `DawnDefaultSetup`, so that a user who installs a custom proc table
+// before calling `DawnDefaultSetup` is not silently overwritten.
+static std::once_flag g_procsOnce;
+
+extern "C" void C_SkgpuGraphite_SetProcTable(const DawnProcTable* procs) {
+    std::call_once(g_procsOnce, [procs]() { dawnProcSetProcs(procs); });
+}
+
+extern "C" void C_SkgpuGraphite_SetDefaultProcTable() {
+    std::call_once(g_procsOnce, []() {
+        static DawnProcTable procs = dawn::native::GetProcs();
+        dawnProcSetProcs(&procs);
+    });
+}
+
+// Writes the proc table that routes to Dawn's native implementation into
+// `*out`. Useful when callers want to clone the default table and override
+// individual entries before installing.
+extern "C" void C_SkgpuGraphite_GetDefaultDawnProcTable(DawnProcTable* out) {
+    *out = dawn::native::GetProcs();
+}
+
+// Force bindgen to surface the DawnProcTable struct type.
+extern "C" void C_SkgpuGraphite_UnreferencedTypes_DawnProcTable(DawnProcTable*) {}
+
 extern "C" bool C_SkgpuGraphite_DawnDefaultSetup(
         WGPUInstance* outInstance,
         WGPUDevice* outDevice,
@@ -79,16 +107,7 @@ extern "C" bool C_SkgpuGraphite_DawnDefaultSetup(
     *outDevice = nullptr;
     *outQueue = nullptr;
 
-    // The `dawn_proc` dispatcher routes all wgpu* calls through a function-
-    // pointer table that is null until we point it at Dawn's native procs.
-    // We do this exactly once per process; it is safe to set the same table
-    // from multiple threads but `dawnProcSetProcs` itself is not thread-safe,
-    // so guard with std::once_flag.
-    static std::once_flag procsOnce;
-    std::call_once(procsOnce, []() {
-        static DawnProcTable procs = dawn::native::GetProcs();
-        dawnProcSetProcs(&procs);
-    });
+    C_SkgpuGraphite_SetDefaultProcTable();
 
     // Request the TimedWaitAny instance feature so we can block on adapter /
     // device futures with a real timeout (UINT64_MAX = wait forever).

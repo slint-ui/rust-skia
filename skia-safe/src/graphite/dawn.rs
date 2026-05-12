@@ -1,11 +1,17 @@
 //! Dawn backend factory for Graphite [`Context`].
 
-use std::{fmt, ptr};
+use std::{fmt, mem::MaybeUninit, ptr};
 
 use skia_bindings::{self as sb, WGPUDevice, WGPUInstance, WGPUQueue, WGPUTexture};
 
 use super::{BackendTexture, Context, ContextOptions};
 use crate::prelude::*;
+
+/// Re-export of Dawn's `DawnProcTable` — the function-pointer table that the
+/// `dawn_proc` dispatcher consults for every `wgpu*` call. Custom backends or
+/// instrumentation layers can build their own table and install it via
+/// [`install_proc_table`].
+pub use sb::DawnProcTable;
 
 /// Raw WebGPU handles that Graphite needs to construct a Dawn-backed
 /// [`Context`].
@@ -123,6 +129,46 @@ impl Drop for DawnDevice {
             sb::wgpuDeviceRelease(self.device);
             sb::wgpuInstanceRelease(self.instance);
         }
+    }
+}
+
+/// Installs `procs` as the global `wgpu*` dispatcher table for the process.
+///
+/// Dawn's WebGPU C API is routed through a function-pointer table set by
+/// `dawnProcSetProcs`. Calling this installs `procs` instead of the default
+/// Dawn-native implementation. **First caller wins**: subsequent installs
+/// (including the implicit install done by [`DawnDevice::new`]) are no-ops.
+/// To take effect, this must be called before any `wgpu*` function is
+/// invoked and before constructing a [`DawnDevice`] or [`Context`].
+///
+/// Typical use cases: routing calls to a different WebGPU implementation
+/// (such as `wgpu-native`), instrumenting them, or capturing them for replay.
+///
+/// # Safety
+///
+/// `procs` must remain valid for the entire lifetime of the process — store
+/// it in a `static` or leak it. Any field of `procs` that is `None` will
+/// cause the corresponding `wgpu*` call to dereference null and crash, so
+/// the table must be complete enough to cover everything Skia plus the rest
+/// of your code uses. Concurrent calls are serialized internally; the first
+/// one wins.
+pub unsafe fn install_proc_table(procs: &'static DawnProcTable) {
+    sb::C_SkgpuGraphite_SetProcTable(procs);
+}
+
+/// Returns the proc table that routes every call to Dawn's native
+/// implementation. Useful as a starting point: clone, override individual
+/// entries (for instrumentation or partial substitution), then install the
+/// result via [`install_proc_table`].
+///
+/// The returned table is a value copy; the function pointers inside it
+/// reference statically-linked Dawn symbols that are valid for the program's
+/// lifetime.
+pub fn default_dawn_proc_table() -> DawnProcTable {
+    let mut table = MaybeUninit::<DawnProcTable>::uninit();
+    unsafe {
+        sb::C_SkgpuGraphite_GetDefaultDawnProcTable(table.as_mut_ptr());
+        table.assume_init()
     }
 }
 
