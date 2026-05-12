@@ -132,6 +132,20 @@ struct PipelineLayoutData {
     _device: wgpu::Device,
 }
 
+/// A CommandEncoder is consumed (moved) by `finish()`. wgpu's API takes
+/// ownership of the encoder, returning a CommandBuffer. We model that by
+/// stashing the encoder in a `Mutex<Option<...>>` so we can move it out
+/// during `finish` regardless of which thread holds the C-side handle.
+struct CommandEncoderData {
+    inner: std::sync::Mutex<Option<wgpu::CommandEncoder>>,
+    _device: wgpu::Device,
+}
+
+struct CommandBufferData {
+    inner: std::sync::Mutex<Option<wgpu::CommandBuffer>>,
+    _device: wgpu::Device,
+}
+
 /// Borrows a `WGPUStringView` as a Rust `&str`. Handles WebGPU's sentinel
 /// values: `WGPU_STRLEN` (== `usize::MAX`) means "data is a C string, find
 /// the NUL terminator yourself"; the empty view (null data, zero length) and
@@ -971,12 +985,12 @@ unsafe extern "C" fn buffer_get_mapped_range(
     let buffer = &Resource::<BufferData>::inner(handle as _).inner;
     let (start, end) = buffer_slice_range(buffer, offset, size);
     let mut view = buffer.slice(start..end).get_mapped_range_mut();
-    let ptr = view.slice(..).as_raw_element_ptr().as_ptr() as *mut core::ffi::c_void;
-    // We hand the raw pointer back to Skia; the BufferViewMut's drop would
-    // unregister it from wgpu's bookkeeping prematurely, so we leak it and
-    // rely on `bufferUnmap` to do the actual release.
-    core::mem::forget(view);
-    ptr
+    // The pointer to the mapped memory remains valid until the buffer is
+    // unmapped — wgpu tracks the view's *bookkeeping* via its Drop impl, but
+    // not the pointer itself. We let the view drop normally so unmap()
+    // doesn't trip on "view still active"; the C-side pointer is fine to
+    // use until Skia calls bufferUnmap.
+    view.slice(..).as_raw_element_ptr().as_ptr() as *mut core::ffi::c_void
 }
 
 unsafe extern "C" fn buffer_get_const_mapped_range(
@@ -987,9 +1001,7 @@ unsafe extern "C" fn buffer_get_const_mapped_range(
     let buffer = &Resource::<BufferData>::inner(handle as _).inner;
     let (start, end) = buffer_slice_range(buffer, offset, size);
     let view = buffer.slice(start..end).get_mapped_range();
-    let ptr = (*view).as_ptr() as *const core::ffi::c_void;
-    core::mem::forget(view);
-    ptr
+    (*view).as_ptr() as *const core::ffi::c_void
 }
 
 unsafe extern "C" fn buffer_unmap(handle: sb::WGPUBuffer) {
@@ -997,6 +1009,13 @@ unsafe extern "C" fn buffer_unmap(handle: sb::WGPUBuffer) {
         return;
     }
     Resource::<BufferData>::inner(handle as _).inner.unmap();
+}
+
+unsafe extern "C" fn buffer_get_map_state(_handle: sb::WGPUBuffer) -> sb::WGPUBufferMapState {
+    // wgpu 29 doesn't yet expose Buffer::map_state(). Returning Unmapped is
+    // conservative — Skia uses this to decide whether to call unmap during
+    // cleanup; reporting "not mapped" just skips a no-op unmap.
+    sb::WGPUBufferMapState::WGPUBufferMapState_Unmapped
 }
 
 unsafe extern "C" fn buffer_map_async(
@@ -1077,12 +1096,189 @@ unsafe extern "C" fn queue_write_buffer(
 
 unsafe extern "C" fn queue_submit(
     queue: sb::WGPUQueue,
-    _command_count: usize,
-    _commands: *const sb::WGPUCommandBuffer,
+    command_count: usize,
+    commands: *const sb::WGPUCommandBuffer,
 ) {
-    let _ = Resource::<QueueData>::inner(queue as _);
-    // TODO: collect command buffers and call queue.submit(...). Stubbed for
-    // now so the rest of the path keeps progressing.
+    let queue_data = Resource::<QueueData>::inner(queue as _);
+    if command_count == 0 || commands.is_null() {
+        let _ = queue_data.inner.submit(std::iter::empty());
+        return;
+    }
+    let handles = std::slice::from_raw_parts(commands, command_count);
+    let buffers: Vec<wgpu::CommandBuffer> = handles
+        .iter()
+        .filter_map(|h| {
+            if h.is_null() {
+                None
+            } else {
+                Resource::<CommandBufferData>::inner(*h as _)
+                    .inner
+                    .lock()
+                    .ok()
+                    .and_then(|mut g| g.take())
+            }
+        })
+        .collect();
+    let _ = queue_data.inner.submit(buffers);
+}
+
+//
+// CommandEncoder
+//
+
+unsafe extern "C" fn device_create_command_encoder(
+    device: sb::WGPUDevice,
+    descriptor: *const sb::WGPUCommandEncoderDescriptor,
+) -> sb::WGPUCommandEncoder {
+    let device_data = Resource::<DeviceData>::inner(device as _);
+    let label_str = if descriptor.is_null() {
+        ""
+    } else {
+        string_view_as_str((*descriptor).label)
+    };
+    let encoder = device_data
+        .inner
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: if label_str.is_empty() {
+                None
+            } else {
+                Some(label_str)
+            },
+        });
+    Resource::into_handle(CommandEncoderData {
+        inner: std::sync::Mutex::new(Some(encoder)),
+        _device: device_data.inner.clone(),
+    }) as sb::WGPUCommandEncoder
+}
+
+unsafe extern "C" fn command_encoder_add_ref(handle: sb::WGPUCommandEncoder) {
+    Resource::<CommandEncoderData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn command_encoder_release(handle: sb::WGPUCommandEncoder) {
+    Resource::<CommandEncoderData>::release(handle as _);
+}
+
+unsafe extern "C" fn command_encoder_set_label(
+    _handle: sb::WGPUCommandEncoder,
+    _label: sb::WGPUStringView,
+) {
+}
+
+unsafe extern "C" fn command_encoder_finish(
+    handle: sb::WGPUCommandEncoder,
+    _descriptor: *const sb::WGPUCommandBufferDescriptor,
+) -> sb::WGPUCommandBuffer {
+    let encoder_data = Resource::<CommandEncoderData>::inner(handle as _);
+    let Some(encoder) = encoder_data.inner.lock().ok().and_then(|mut g| g.take()) else {
+        return ptr::null_mut();
+    };
+    let buffer = encoder.finish();
+    Resource::into_handle(CommandBufferData {
+        inner: std::sync::Mutex::new(Some(buffer)),
+        _device: encoder_data._device.clone(),
+    }) as sb::WGPUCommandBuffer
+}
+
+unsafe extern "C" fn command_encoder_insert_debug_marker(
+    _handle: sb::WGPUCommandEncoder,
+    _label: sb::WGPUStringView,
+) {
+}
+
+unsafe extern "C" fn command_encoder_push_debug_group(
+    _handle: sb::WGPUCommandEncoder,
+    _label: sb::WGPUStringView,
+) {
+}
+
+unsafe extern "C" fn command_encoder_pop_debug_group(_handle: sb::WGPUCommandEncoder) {}
+
+fn with_encoder<F>(encoder: sb::WGPUCommandEncoder, f: F)
+where
+    F: FnOnce(&mut wgpu::CommandEncoder),
+{
+    if encoder.is_null() {
+        return;
+    }
+    let data = unsafe { Resource::<CommandEncoderData>::inner(encoder as _) };
+    if let Ok(mut guard) = data.inner.lock() {
+        if let Some(enc) = guard.as_mut() {
+            f(enc);
+        }
+    }
+}
+
+unsafe extern "C" fn command_encoder_copy_buffer_to_buffer(
+    encoder: sb::WGPUCommandEncoder,
+    source: sb::WGPUBuffer,
+    source_offset: u64,
+    destination: sb::WGPUBuffer,
+    destination_offset: u64,
+    size: u64,
+) {
+    let src = &Resource::<BufferData>::inner(source as _).inner;
+    let dst = &Resource::<BufferData>::inner(destination as _).inner;
+    with_encoder(encoder, |enc| {
+        enc.copy_buffer_to_buffer(src, source_offset, dst, destination_offset, Some(size));
+    });
+}
+
+unsafe extern "C" fn command_encoder_clear_buffer(
+    encoder: sb::WGPUCommandEncoder,
+    buffer: sb::WGPUBuffer,
+    offset: u64,
+    size: u64,
+) {
+    let buf = &Resource::<BufferData>::inner(buffer as _).inner;
+    with_encoder(encoder, |enc| {
+        enc.clear_buffer(buf, offset, if size == u64::MAX { None } else { Some(size) });
+    });
+}
+
+unsafe extern "C" fn command_buffer_add_ref(handle: sb::WGPUCommandBuffer) {
+    Resource::<CommandBufferData>::add_ref(handle as _);
+}
+
+unsafe extern "C" fn command_buffer_release(handle: sb::WGPUCommandBuffer) {
+    Resource::<CommandBufferData>::release(handle as _);
+}
+
+unsafe extern "C" fn command_buffer_set_label(
+    _handle: sb::WGPUCommandBuffer,
+    _label: sb::WGPUStringView,
+) {
+}
+
+unsafe extern "C" fn queue_on_submitted_work_done(
+    queue: sb::WGPUQueue,
+    callback_info: sb::WGPUQueueWorkDoneCallbackInfo,
+) -> sb::WGPUFuture {
+    let queue_data = Resource::<QueueData>::inner(queue as _);
+    // Drive any pending GPU work to completion synchronously so the callback
+    // fires from this thread before we return.
+    queue_data
+        ._device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .ok();
+
+    if let Some(callback) = callback_info.callback {
+        let message = sb::WGPUStringView {
+            data: ptr::null(),
+            length: 0,
+        };
+        callback(
+            sb::WGPUQueueWorkDoneStatus::WGPUQueueWorkDoneStatus_Success,
+            message,
+            callback_info.userdata1,
+            callback_info.userdata2,
+        );
+    }
+
+    sb::WGPUFuture { id: 0 }
 }
 
 //
@@ -1246,9 +1442,27 @@ pub fn wgpu_proc_table() -> DawnProcTable {
     table.bufferGetConstMappedRange = Some(buffer_get_const_mapped_range);
     table.bufferUnmap = Some(buffer_unmap);
     table.bufferMapAsync = Some(buffer_map_async);
+    table.bufferGetMapState = Some(buffer_get_map_state);
 
     table.queueWriteBuffer = Some(queue_write_buffer);
     table.queueSubmit = Some(queue_submit);
+
+    table.deviceCreateCommandEncoder = Some(device_create_command_encoder);
+    table.commandEncoderAddRef = Some(command_encoder_add_ref);
+    table.commandEncoderRelease = Some(command_encoder_release);
+    table.commandEncoderSetLabel = Some(command_encoder_set_label);
+    table.commandEncoderFinish = Some(command_encoder_finish);
+    table.commandEncoderInsertDebugMarker = Some(command_encoder_insert_debug_marker);
+    table.commandEncoderPushDebugGroup = Some(command_encoder_push_debug_group);
+    table.commandEncoderPopDebugGroup = Some(command_encoder_pop_debug_group);
+    table.commandEncoderCopyBufferToBuffer = Some(command_encoder_copy_buffer_to_buffer);
+    table.commandEncoderClearBuffer = Some(command_encoder_clear_buffer);
+
+    table.commandBufferAddRef = Some(command_buffer_add_ref);
+    table.commandBufferRelease = Some(command_buffer_release);
+    table.commandBufferSetLabel = Some(command_buffer_set_label);
+
+    table.queueOnSubmittedWorkDone = Some(queue_on_submitted_work_done);
 
     table.deviceCreatePipelineLayout = Some(device_create_pipeline_layout);
     table.pipelineLayoutAddRef = Some(pipeline_layout_add_ref);

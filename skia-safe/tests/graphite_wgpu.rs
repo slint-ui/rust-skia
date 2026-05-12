@@ -11,6 +11,7 @@
 #![cfg(all(feature = "graphite", feature = "wgpu"))]
 
 use skia_safe::graphite::{
+    self,
     dawn::{install_proc_table, DawnDevice},
     wgpu_backend::wgpu_proc_table,
 };
@@ -38,4 +39,11 @@ fn dawn_setup_through_wgpu_proc_table() {
         dawn.device(),
         dawn.queue(),
     );
+
+    let backend = dawn.backend_context();
+    let opts = graphite::ContextOptions::default();
+    let ctx = unsafe { graphite::Context::new_dawn(&backend, &opts) }
+        .expect("Context::new_dawn through wgpu");
+    assert_eq!(ctx.backend(), graphite::BackendApi::Dawn);
+    eprintln!("Context::new_dawn succeeded through wgpu: {ctx:?}");
 }
