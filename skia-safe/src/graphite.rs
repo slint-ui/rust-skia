@@ -14,10 +14,13 @@ pub mod dawn;
 mod options;
 mod recorder;
 mod recording;
+pub mod surfaces;
 mod types;
 
 pub use context::Context;
 pub use options::{ContextOptions, RecorderOptions};
 pub use recorder::Recorder;
 pub use recording::Recording;
-pub use types::{BackendApi, CallbackResult, MarkFrameBoundary, SubmitInfo, SyncToCpu};
+pub use types::{
+    BackendApi, CallbackResult, InsertStatus, MarkFrameBoundary, Mipmapped, SubmitInfo, SyncToCpu,
+};

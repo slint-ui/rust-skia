@@ -804,6 +804,10 @@ const ENUM_REWRITES: &[EnumEntry] = &[
     ("CallbackResult", rewrite::k_xxx),
     ("SyncToCpu", rewrite::k_xxx),
     ("MarkFrameBoundary", rewrite::k_xxx),
+    // skgpu::graphite::InsertStatus::V — the only enum named "V" we currently
+    // generate bindings for. If another "V" enum shows up in the future, this
+    // rewrite will need to be made more specific.
+    ("V", rewrite::k_xxx),
 ];
 
 pub(crate) mod rewrite {

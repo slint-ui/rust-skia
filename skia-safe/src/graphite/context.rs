@@ -2,8 +2,8 @@ use std::fmt;
 
 use skia_bindings::{self as sb, skgpu_graphite_Context};
 
-use super::{BackendApi, Recorder, RecorderOptions, SubmitInfo};
-use crate::prelude::*;
+use super::{BackendApi, InsertStatus, Recorder, RecorderOptions, Recording, SubmitInfo};
+use crate::{prelude::*, Surface};
 
 pub type Context = RefHandle<skgpu_graphite_Context>;
 unsafe_send_sync!(Context);
@@ -37,6 +37,23 @@ impl Context {
 
     pub fn submit(&mut self, info: &SubmitInfo) -> bool {
         unsafe { sb::C_SkgpuGraphiteContext_submit(self.native_mut(), info) }
+    }
+
+    /// Replays a Recording against the optional target Surface and queues
+    /// resulting GPU work for the next [`Self::submit`]. The Recording is
+    /// borrowed; the caller retains ownership.
+    pub fn insert_recording(
+        &mut self,
+        recording: &mut Recording,
+        target_surface: Option<&mut Surface>,
+    ) -> InsertStatus {
+        unsafe {
+            sb::C_SkgpuGraphite_Context_insertRecording(
+                self.native_mut(),
+                recording.native_mut(),
+                target_surface.map_or(core::ptr::null_mut(), |s| s.native_mut()),
+            )
+        }
     }
 
     pub fn has_unfinished_gpu_work(&self) -> bool {

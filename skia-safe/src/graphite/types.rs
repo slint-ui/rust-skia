@@ -19,3 +19,15 @@ variant_name!(MarkFrameBoundary::Yes);
 variant_name!(MarkFrameBoundary::No);
 
 pub use sb::skgpu_graphite_SubmitInfo as SubmitInfo;
+
+pub use sb::skgpu_Mipmapped as Mipmapped;
+variant_name!(Mipmapped::Yes);
+variant_name!(Mipmapped::No);
+
+pub use sb::skgpu_graphite_InsertStatus_V as InsertStatus;
+variant_name!(InsertStatus::Success);
+variant_name!(InsertStatus::InvalidRecording);
+variant_name!(InsertStatus::PromiseImageInstantiationFailed);
+variant_name!(InsertStatus::AddCommandsFailed);
+variant_name!(InsertStatus::AsyncShaderCompilesFailed);
+variant_name!(InsertStatus::OutOfOrderRecording);

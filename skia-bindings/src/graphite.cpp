@@ -7,11 +7,16 @@
 
 #include "bindings.h"
 
+#include "include/core/SkImageInfo.h"
+#include "include/core/SkSurface.h"
+#include "include/core/SkSurfaceProps.h"
+#include "include/gpu/GpuTypes.h"
 #include "include/gpu/graphite/Context.h"
 #include "include/gpu/graphite/ContextOptions.h"
 #include "include/gpu/graphite/GraphiteTypes.h"
 #include "include/gpu/graphite/Recorder.h"
 #include "include/gpu/graphite/Recording.h"
+#include "include/gpu/graphite/Surface.h"
 
 namespace skgr = skgpu::graphite;
 
@@ -46,6 +51,20 @@ extern "C" bool C_SkgpuGraphiteContext_submit(
         skgr::Context* ctx,
         const skgr::SubmitInfo* submitInfo) {
     return ctx->submit(*submitInfo);
+}
+
+// Inserts a Recording for replay against an optional target surface. The
+// Recording is not consumed by this call — the caller still owns it and must
+// drop it after submission (Skia internally retains what it needs).
+extern "C" skgr::InsertStatus::V C_SkgpuGraphite_Context_insertRecording(
+        skgr::Context* ctx,
+        skgr::Recording* recording,
+        SkSurface* targetSurface) {
+    skgr::InsertRecordingInfo info;
+    info.fRecording = recording;
+    info.fTargetSurface = targetSurface;
+    skgr::InsertStatus status = ctx->insertRecording(info);
+    return static_cast<skgr::InsertStatus::V>(status);
 }
 
 extern "C" bool C_SkgpuGraphiteContext_hasUnfinishedGpuWork(const skgr::Context* ctx) {
@@ -158,4 +177,21 @@ extern "C" void C_SkgpuGraphiteRecorderOptions_Construct(skgr::RecorderOptions* 
 
 extern "C" void C_SkgpuGraphiteRecorderOptions_destruct(skgr::RecorderOptions* opts) {
     opts->~RecorderOptions();
+}
+
+//
+// SkSurfaces:: factories for Graphite
+//
+
+// Allocates a renderable surface backed by a Graphite texture. Caller takes
+// ownership of the returned SkSurface (refcounted) and is responsible for
+// dropping it.
+extern "C" SkSurface* C_SkgpuGraphite_Surfaces_RenderTarget(
+        skgr::Recorder* recorder,
+        const SkImageInfo* imageInfo,
+        skgpu::Mipmapped mipmapped,
+        const SkSurfaceProps* surfaceProps) {
+    sk_sp<SkSurface> surface = SkSurfaces::RenderTarget(
+            recorder, *imageInfo, mipmapped, surfaceProps);
+    return surface.release();
 }
